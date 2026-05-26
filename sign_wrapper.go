@@ -10,7 +10,7 @@ import (
 	"sync"
 	"time"
 
-	"google.golang.org/protobuf/proto"
+	"github.com/golang/protobuf/proto"
 
 	pb "go.etcd.io/raft/v3/raftpb"
 )
@@ -69,7 +69,7 @@ type SignNode struct {
 
 	mu        sync.Mutex
 	lastSeen  map[uint64]int64 // sender ID -> last accepted unix nanos
-	localSent int64             // last timestamp used when signing outbound messages
+	localSent int64            // last timestamp used when signing outbound messages
 
 	readyc chan Ready
 	done   chan struct{}
@@ -132,11 +132,11 @@ func (sn *SignNode) Step(ctx context.Context, m *pb.Message) error {
 	if m == nil {
 		return errors.New("cannot step with nil message")
 	}
-	mm := proto.Clone(m).(*pb.Message)
-	if err := sn.verifyMessage(mm); err != nil {
+	// mm := proto.Clone(m).(*pb.Message)
+	if err := sn.verifyMessage(m); err != nil {
 		return err
 	}
-	return sn.Node.Step(ctx, mm)
+	return sn.Node.Step(ctx, *m)
 }
 
 func (sn *SignNode) Stop() {
@@ -148,42 +148,42 @@ func (sn *SignNode) Stop() {
 	sn.Node.Stop()
 }
 
-func (sn *SignNode) signMessages(msgs []*pb.Message) []*pb.Message {
+func (sn *SignNode) signMessages(msgs []pb.Message) []pb.Message {
 	if len(msgs) == 0 {
 		return msgs
 	}
-	out := make([]*pb.Message, len(msgs))
+	out := make([]pb.Message, len(msgs))
 	for i, m := range msgs {
 		out[i] = sn.signMessageTree(m)
 	}
 	return out
 }
 
-func (sn *SignNode) signMessageTree(m *pb.Message) *pb.Message {
-	mm := proto.Clone(m).(*pb.Message)
+func (sn *SignNode) signMessageTree(m pb.Message) pb.Message {
+	mm := proto.Clone(&m).(*pb.Message)
 	if shouldSign(mm, sn.selfID, sn.peerPubKeys, sn.clientIDs, sn.clientPub) {
 		if err := sn.signMessage(mm); err != nil {
 			panic(err)
 		}
 	}
-	for i, r := range mm.Responses {
-		mm.Responses[i] = sn.signMessageTree(r)
+	for i := range mm.Responses {
+		mm.Responses[i] = sn.signMessageTree(mm.Responses[i])
 	}
-	return mm
+	return *mm
 }
 
 func (sn *SignNode) verifyMessage(m *pb.Message) error {
 	if !shouldVerify(m, sn.selfID, sn.peerPubKeys, sn.clientIDs, sn.clientPub) {
 		return nil
 	}
-	sig, ts, origCtx, err := parseSignature(m.GetContext())
+	sig, ts, origCtx, err := parseSignature(m.Context)
 	if err != nil {
 		return err
 	}
-	if err := sn.checkFreshness(m.GetFrom(), ts); err != nil {
+	if err := sn.checkFreshness(m.From, ts); err != nil {
 		return err
 	}
-	pub, ok := lookupPubKey(m.GetFrom(), sn.peerPubKeys, sn.clientIDs, sn.clientPub)
+	pub, ok := lookupPubKey(m.From, sn.peerPubKeys, sn.clientIDs, sn.clientPub)
 	if !ok {
 		return ErrUnknownSigner
 	}
@@ -194,10 +194,10 @@ func (sn *SignNode) verifyMessage(m *pb.Message) error {
 	if !ed25519.Verify(pub, data, sig) {
 		return ErrInvalidSignature
 	}
-	sn.recordSeen(m.GetFrom(), ts)
+	sn.recordSeen(m.From, ts)
 	m.Context = origCtx
-	for _, r := range m.Responses {
-		if err := sn.verifyMessage(r); err != nil {
+	for i := range m.Responses {
+		if err := sn.verifyMessage(&m.Responses[i]); err != nil {
 			return err
 		}
 	}
@@ -216,7 +216,7 @@ func (sn *SignNode) nextSignTimestamp() int64 {
 }
 
 func (sn *SignNode) signMessage(m *pb.Message) error {
-	origCtx := normalizeContext(m.GetContext())
+	origCtx := normalizeContext(m.Context)
 	ts := sn.nextSignTimestamp()
 	data, err := messageSignBytes(m, origCtx, ts)
 	if err != nil {
@@ -295,7 +295,7 @@ func shouldSign(m *pb.Message, selfID uint64, peerPubKeys map[uint64]ed25519.Pub
 	if isInternalMessage(m) {
 		return false
 	}
-	return isPeerOrClient(m.GetTo(), selfID, peerPubKeys, clientIDs, clientPub)
+	return isPeerOrClient(m.To, selfID, peerPubKeys, clientIDs, clientPub)
 }
 
 // shouldVerify reports whether an inbound message must carry a valid signature.
@@ -303,14 +303,14 @@ func shouldVerify(m *pb.Message, selfID uint64, peerPubKeys map[uint64]ed25519.P
 	if isInternalMessage(m) {
 		return false
 	}
-	return isPeerOrClient(m.GetFrom(), selfID, peerPubKeys, clientIDs, clientPub)
+	return isPeerOrClient(m.From, selfID, peerPubKeys, clientIDs, clientPub)
 }
 
 func isInternalMessage(m *pb.Message) bool {
-	if IsLocalMsg(m.GetType()) {
+	if IsLocalMsg(m.Type) {
 		return true
 	}
-	if IsLocalMsgTarget(m.GetTo()) || IsLocalMsgTarget(m.GetFrom()) {
+	if IsLocalMsgTarget(m.To) || IsLocalMsgTarget(m.From) {
 		return true
 	}
 	return false
