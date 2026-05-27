@@ -199,6 +199,9 @@ func (ln *LogPVNode) setLogHash(next [hashSize]byte) {
 	ln.logHash = next
 }
 
+// should only update the hash if the message is a storage append and the target is the local append thread
+// and the entries are not empty
+
 func (ln *LogPVNode) updateHashFromStorageMessages(msgs []pb.Message) {
 	for i := range msgs {
 		ln.updateHashFromStorageMessageTree(&msgs[i])
