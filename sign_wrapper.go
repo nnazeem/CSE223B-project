@@ -38,6 +38,8 @@ type SignConfig struct {
 	MaxAge time.Duration
 	// Now returns the current time. Defaults to time.Now.
 	Now func() time.Time
+	// LeaderProofQuorum enables leader proof attach/verify when > 0.
+	LeaderProofQuorum int
 }
 
 func (c *SignConfig) maxAge() time.Duration {
@@ -52,6 +54,13 @@ func (c *SignConfig) now() time.Time {
 		return time.Now()
 	}
 	return c.Now()
+}
+
+func (c *SignConfig) leaderProofQuorum() int {
+	if c == nil || c.LeaderProofQuorum <= 0 {
+		return 0
+	}
+	return c.LeaderProofQuorum
 }
 
 // SignNode wraps a Node and signs outbound raft messages destined for other
@@ -70,6 +79,7 @@ type SignNode struct {
 	mu        sync.Mutex
 	lastSeen  map[uint64]int64 // sender ID -> last accepted unix nanos
 	localSent int64            // last timestamp used when signing outbound messages
+	leaderSeen map[uint64]pb.Message
 
 	readyc chan Ready
 	done   chan struct{}
@@ -101,6 +111,7 @@ func WrapNode(
 		clientPub:   clientPub,
 		cfg:         c,
 		lastSeen:    make(map[uint64]int64),
+		leaderSeen:  make(map[uint64]pb.Message),
 		readyc:      make(chan Ready),
 		done:        make(chan struct{}),
 	}
@@ -132,9 +143,13 @@ func (sn *SignNode) Step(ctx context.Context, m *pb.Message) error {
 	if m == nil {
 		return errors.New("cannot step with nil message")
 	}
-	// mm := proto.Clone(m).(*pb.Message)
 	if err := sn.verifyMessage(m); err != nil {
 		return err
+	}
+	if shouldVerifyLeaderProof(m, sn.selfID, sn.peerPubKeys, sn.cfg.leaderProofQuorum()) {
+		if err := sn.VerifyLeader(m); err != nil {
+			return err
+		}
 	}
 	return sn.Node.Step(ctx, *m)
 }
@@ -161,6 +176,11 @@ func (sn *SignNode) signMessages(msgs []pb.Message) []pb.Message {
 
 func (sn *SignNode) signMessageTree(m pb.Message) pb.Message {
 	mm := proto.Clone(&m).(*pb.Message)
+	if shouldAttachLeaderProof(mm, sn.selfID, sn.peerPubKeys, sn.clientIDs, sn.clientPub, sn.cfg.leaderProofQuorum()) {
+		if err := sn.AddLeaderProof(mm); err != nil {
+			panic(err)
+		}
+	}
 	if shouldSign(mm, sn.selfID, sn.peerPubKeys, sn.clientIDs, sn.clientPub) {
 		if err := sn.signMessage(mm); err != nil {
 			panic(err)
@@ -175,6 +195,10 @@ func (sn *SignNode) signMessageTree(m pb.Message) pb.Message {
 func (sn *SignNode) verifyMessage(m *pb.Message) error {
 	if !shouldVerify(m, sn.selfID, sn.peerPubKeys, sn.clientIDs, sn.clientPub) {
 		return nil
+	}
+	var signedForProof *pb.Message
+	if sn.cfg.leaderProofQuorum() > 0 && shouldRecordLeaderAttestation(m, sn.selfID, sn.peerPubKeys) {
+		signedForProof = proto.Clone(m).(*pb.Message)
 	}
 	sig, ts, origCtx, err := parseSignature(m.Context)
 	if err != nil {
@@ -195,6 +219,9 @@ func (sn *SignNode) verifyMessage(m *pb.Message) error {
 		return ErrInvalidSignature
 	}
 	sn.recordSeen(m.From, ts)
+	if signedForProof != nil {
+		sn.recordLeaderAttestation(signedForProof, ts)
+	}
 	m.Context = origCtx
 	for i := range m.Responses {
 		if err := sn.verifyMessage(&m.Responses[i]); err != nil {
