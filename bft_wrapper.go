@@ -40,7 +40,6 @@ type bftSeqKey struct {
 	seq  uint64
 }
 
-// ClientProofConfig configures freshness checks for client proofs.
 type ClientProofConfig struct {
 	MaxAge time.Duration
 	Now    func() time.Time
@@ -48,7 +47,7 @@ type ClientProofConfig struct {
 
 func (c *ClientProofConfig) maxAge() time.Duration {
 	if c == nil || c.MaxAge <= 0 {
-		return DefaultMaxMessageAge // Defined in sign_wrapper.go
+		return DefaultMaxMessageAge
 	}
 	return c.MaxAge
 }
@@ -85,9 +84,6 @@ func decodeBFTContext(data []byte) (BFTContext, error) {
 // Shared Cryptographic Utility
 // ====================================================================
 
-// VerifyBFTMessageSignature extracts the signature from the context,
-// rebuilds the signed payload, and verifies it against the provided public key.
-// It returns the timestamp of the signature and the original, clean context.
 func VerifyBFTMessageSignature(m *pb.Message, pubKey ed25519.PublicKey) (int64, []byte, error) {
 	if len(pubKey) == 0 {
 		return 0, nil, ErrUnknownSigner
@@ -115,7 +111,7 @@ func VerifyBFTMessageSignature(m *pb.Message, pubKey ed25519.PublicKey) (int64, 
 // ====================================================================
 
 type BFTNode struct {
-	Node        // Embedded etcd raft.Node
+	Node
 	selfID      uint64
 	n           uint64
 	f           uint64
@@ -154,11 +150,11 @@ func WrapBFTNode(
 		c = *cfg
 	}
 
-	return &BFTNode{
+	bn := &BFTNode{
 		Node:        n,
 		selfID:      selfID,
 		n:           totalNodes,
-		f:           (totalNodes - 1) / 3, // $f$ max Byzantine faults
+		f:           (totalNodes - 1) / 3,
 		priv:        priv,
 		nodePubKeys: nodePubKeys,
 		clientIDs:   clientIDSet(clientIDs),
@@ -177,6 +173,9 @@ func WrapBFTNode(
 		bftMsgs:    make([]pb.Message, 0),
 		readyc:     make(chan Ready),
 	}
+
+	go bn.forwardReady()
+	return bn
 }
 
 func (bn *BFTNode) forwardReady() {
@@ -190,9 +189,7 @@ func (bn *BFTNode) forwardReady() {
 	}
 }
 
-func (bn *BFTNode) Ready() <-chan Ready {
-	return bn.readyc
-}
+func (bn *BFTNode) Ready() <-chan Ready { return bn.readyc }
 
 func (bn *BFTNode) Advance() {
 	bn.mu.Lock()
@@ -201,9 +198,7 @@ func (bn *BFTNode) Advance() {
 	bn.Node.Advance()
 }
 
-func (bn *BFTNode) Tick() {
-	bn.Node.Tick()
-}
+func (bn *BFTNode) Tick() { bn.Node.Tick() }
 
 func (bn *BFTNode) Propose(ctx context.Context, data []byte) error {
 	return errors.New("bft: nodes must propose via BFTClient")
@@ -219,7 +214,7 @@ func (bn *BFTNode) Step(ctx context.Context, m *pb.Message) error {
 	}
 
 	if err := bn.verifyMessage(m); err != nil {
-		return err // Drop invalid messages
+		return err
 	}
 
 	bn.mu.Lock()
@@ -227,10 +222,19 @@ func (bn *BFTNode) Step(ctx context.Context, m *pb.Message) error {
 
 	if bn.isClientRequest(m) {
 		if bn.isLeader() {
-			ppMsg, err := bn.ConstructPP(m)
+			bctx, ppMsg, err := bn.ConstructPP(m)
 			if err != nil {
 				return err
 			}
+
+			// Leader tracks its own vote implicitly
+			key := bftSeqKey{view: bctx.View, seq: bctx.SeqNum}
+			bn.pp[key] = bctx.Digest
+			if bn.prepares[key] == nil {
+				bn.prepares[key] = make(map[uint64]struct{})
+			}
+			bn.prepares[key][bn.selfID] = struct{}{}
+
 			bn.broadcast(ppMsg)
 		}
 		return nil
@@ -261,15 +265,20 @@ func (bn *BFTNode) Step(ctx context.Context, m *pb.Message) error {
 			return err
 		}
 
-		// Ensure the node tracks its own vote for the Prepare Quorum
 		if bn.prepares[key] == nil {
 			bn.prepares[key] = make(map[uint64]struct{})
 		}
-		bn.prepares[key][bn.selfID] = struct{}{}
+
+		// The PrePrepare counts as the Leader's Prepare vote
+		bn.prepares[key][m.From] = struct{}{}
+
+		wasBelow := uint64(len(bn.prepares[key])) < (2*bn.f + 1)
+		bn.prepares[key][bn.selfID] = struct{}{} // Self-vote
+		isAbove := uint64(len(bn.prepares[key])) >= (2*bn.f + 1)
+
 		bn.broadcast(pMsg)
 
-		// Check if quorum is instantly met (e.g. if f=0)
-		if uint64(len(bn.prepares[key])) >= (2*bn.f + 1) {
+		if wasBelow && isAbove {
 			cMsg, err := bn.ConstructC(bctx)
 			if err == nil {
 				if bn.commits[key] == nil {
@@ -289,21 +298,18 @@ func (bn *BFTNode) Step(ctx context.Context, m *pb.Message) error {
 		bn.prepares[key][m.From] = struct{}{}
 		isAbove := uint64(len(bn.prepares[key])) >= (2*bn.f + 1)
 
-		// 2f+1 Quorum reached -> transition to Commit
 		if wasBelow && isAbove {
 			cMsg, err := bn.ConstructC(bctx)
 			if err != nil {
 				return err
 			}
 
-			// Ensure node tracks its own commit vote locally
 			if bn.commits[key] == nil {
 				bn.commits[key] = make(map[uint64]struct{})
 			}
 			bn.commits[key][bn.selfID] = struct{}{}
 			bn.broadcast(cMsg)
 
-			// Check if commit quorum is instantly met (e.g. if f=0)
 			if uint64(len(bn.commits[key])) >= (2*bn.f + 1) {
 				if len(m.Entries) > 0 {
 					for _, ent := range m.Entries {
@@ -322,7 +328,6 @@ func (bn *BFTNode) Step(ctx context.Context, m *pb.Message) error {
 		bn.commits[key][m.From] = struct{}{}
 		isAbove := uint64(len(bn.commits[key])) >= (2*bn.f + 1)
 
-		// 2f+1 Quorum reached -> Commit and apply
 		if wasBelow && isAbove {
 			if len(m.Entries) > 0 {
 				for _, ent := range m.Entries {
@@ -345,7 +350,6 @@ func (bn *BFTNode) verifyMessage(m *pb.Message) error {
 		return ErrUnknownSigner
 	}
 
-	// Use shared utility for peer messages
 	_, origCtx, err := VerifyBFTMessageSignature(m, pubKey)
 	if err != nil {
 		return err
@@ -376,8 +380,7 @@ func (bn *BFTNode) VerifyClient(m *pb.Message) error {
 	return nil
 }
 
-// Phase Message Constructors
-func (bn *BFTNode) ConstructPP(m *pb.Message) (*pb.Message, error) {
+func (bn *BFTNode) ConstructPP(m *pb.Message) (BFTContext, *pb.Message, error) {
 	seq := bn.nextSeqN
 	bn.nextSeqN++
 
@@ -388,10 +391,10 @@ func (bn *BFTNode) ConstructPP(m *pb.Message) (*pb.Message, error) {
 	bctx := BFTContext{Phase: PhasePrePrepare, View: bn.view, SeqNum: seq, Digest: hashData(data)}
 	encCtx, err := encodeBFTContext(bctx)
 	if err != nil {
-		return nil, err
+		return bctx, nil, err
 	}
 
-	return &pb.Message{Type: pb.MsgApp, From: bn.selfID, Context: encCtx, Entries: m.Entries}, nil
+	return bctx, &pb.Message{Type: pb.MsgApp, From: bn.selfID, Context: encCtx, Entries: m.Entries}, nil
 }
 
 func (bn *BFTNode) ConstructP(bctx BFTContext) (*pb.Message, error) {
@@ -493,9 +496,16 @@ func (c *BFTClient) Tick() {
 	for ts, req := range c.pending {
 		req.ticks++
 		if req.ticks > 10 {
+			// Resign specific message payload with distinct target ID to preserve signature
 			for id := uint64(1); id <= c.n; id++ {
 				mCopy := req.msg
 				mCopy.To = id
+
+				origCtx := normalizeContext(mCopy.Context)
+				dataSign, _ := messageSignBytes(&mCopy, origCtx, ts)
+				sig := ed25519.Sign(c.priv, dataSign)
+				mCopy.Context = packSignature(sig, ts, origCtx)
+
 				c.readyc <- mCopy
 			}
 			req.ticks = 0
@@ -504,27 +514,39 @@ func (c *BFTClient) Tick() {
 	}
 }
 
-func (c *BFTClient) Ready() <-chan pb.Message {
-	return c.readyc
-}
+func (c *BFTClient) Ready() <-chan pb.Message { return c.readyc }
 
 func (c *BFTClient) Propose(ctx context.Context, data []byte) error {
-	m := pb.Message{
-		Type:    pb.MsgProp,
-		Entries: []pb.Entry{{Data: data}},
+	c.mu.Lock()
+	ts := c.cfg.now().UnixNano()
+	if ts <= c.lastSent {
+		ts = c.lastSent + 1
 	}
-	ts, err := c.AddClientProof(&m)
-	if err != nil {
-		return err
+	c.lastSent = ts
+	c.mu.Unlock()
+
+	baseMsg := pb.Message{
+		Type:    pb.MsgProp,
+		From:    c.selfID,
+		Entries: []pb.Entry{{Data: data}},
 	}
 
 	c.mu.Lock()
-	c.pending[ts] = &pendingRequest{msg: m, timestamp: ts, ticks: 0}
+	c.pending[ts] = &pendingRequest{msg: baseMsg, timestamp: ts, ticks: 0}
 	c.mu.Unlock()
 
 	for id := uint64(1); id <= c.n; id++ {
-		mCopy := m
+		mCopy := baseMsg
 		mCopy.To = id
+
+		origCtx := normalizeContext(mCopy.Context)
+		dataSign, err := messageSignBytes(&mCopy, origCtx, ts)
+		if err != nil {
+			return err
+		}
+		sig := ed25519.Sign(c.priv, dataSign)
+		mCopy.Context = packSignature(sig, ts, origCtx)
+
 		select {
 		case c.readyc <- mCopy:
 		case <-ctx.Done():
@@ -539,18 +561,14 @@ func (c *BFTClient) Step(ctx context.Context, m *pb.Message) error {
 		return errors.New("nil message")
 	}
 
-	if err := c.verifyMessage(m); err != nil {
+	ts, err := c.verifyMessage(m)
+	if err != nil {
 		return err
 	}
 
 	bctx, err := decodeBFTContext(m.Context)
 	if err != nil || bctx.Phase != PhaseReply {
 		return errors.New("invalid reply message")
-	}
-
-	_, ts, _, err := parseSignature(m.Context)
-	if err != nil {
-		return err
 	}
 
 	c.mu.Lock()
@@ -569,7 +587,6 @@ func (c *BFTClient) Step(ctx context.Context, m *pb.Message) error {
 	for _, res := range c.replies[ts] {
 		resultCounts[string(res)]++
 
-		// f+1 valid replicas returned identical result -> Client reaches Consensus
 		if resultCounts[string(res)] == (c.f + 1) {
 			delete(c.pending, ts)
 			delete(c.replies, ts)
@@ -584,21 +601,22 @@ func (c *BFTClient) Step(ctx context.Context, m *pb.Message) error {
 	return nil
 }
 
-func (c *BFTClient) verifyMessage(m *pb.Message) error {
+func (c *BFTClient) verifyMessage(m *pb.Message) (int64, error) {
 	pubKey, ok := c.nodePubKeys[m.From]
 	if !ok {
-		return ErrUnknownSigner
+		return 0, ErrUnknownSigner
 	}
 
-	_, origCtx, err := VerifyBFTMessageSignature(m, pubKey)
+	ts, origCtx, err := VerifyBFTMessageSignature(m, pubKey)
 	if err != nil {
-		return err
+		return 0, err
 	}
 
 	m.Context = origCtx
-	return nil
+	return ts, nil
 }
 
+// AddClientProof retained to satisfy interface contracts if natively injected directly
 func (c *BFTClient) AddClientProof(m *pb.Message) (int64, error) {
 	m.From = c.selfID
 	origCtx := normalizeContext(m.Context)
