@@ -1,3 +1,4 @@
+// with VSCode Agent Chat
 package raft
 
 import (
@@ -126,6 +127,7 @@ type BFTNode struct {
 	pp       map[bftSeqKey][32]byte
 	prepares map[bftSeqKey]map[uint64]struct{}
 	commits  map[bftSeqKey]map[uint64]struct{}
+	reqs     map[bftSeqKey][]pb.Entry // Buffer to hold full payloads during PBFT consensus
 
 	lowW     uint64
 	highW    uint64
@@ -136,8 +138,10 @@ type BFTNode struct {
 	mu         sync.Mutex
 	clientSeen map[uint64]int64
 
-	bftMsgs []pb.Message
-	readyc  chan Ready
+	bftMsgs  []pb.Message
+	readyc   chan Ready
+	triggerc chan struct{}
+	advancec chan struct{}
 }
 
 func WrapBFTNode(
@@ -164,6 +168,7 @@ func WrapBFTNode(
 		pp:       make(map[bftSeqKey][32]byte),
 		prepares: make(map[bftSeqKey]map[uint64]struct{}),
 		commits:  make(map[bftSeqKey]map[uint64]struct{}),
+		reqs:     make(map[bftSeqKey][]pb.Entry),
 
 		lowW:     0,
 		highW:    2000,
@@ -172,6 +177,8 @@ func WrapBFTNode(
 		clientSeen: make(map[uint64]int64),
 		bftMsgs:    make([]pb.Message, 0),
 		readyc:     make(chan Ready),
+		triggerc:   make(chan struct{}, 1),
+		advancec:   make(chan struct{}),
 	}
 
 	go bn.forwardReady()
@@ -179,23 +186,41 @@ func WrapBFTNode(
 }
 
 func (bn *BFTNode) forwardReady() {
-	for rd := range bn.Node.Ready() {
-		bn.mu.Lock()
-		if len(bn.bftMsgs) > 0 {
-			rd.Messages = append(rd.Messages, bn.bftMsgs...)
+	for {
+		select {
+		case rd, ok := <-bn.Node.Ready():
+			if !ok {
+				return
+			}
+			bn.mu.Lock()
+			if len(bn.bftMsgs) > 0 {
+				rd.Messages = append(rd.Messages, bn.bftMsgs...)
+				bn.bftMsgs = nil
+			}
+			bn.mu.Unlock()
+			bn.readyc <- rd
+			<-bn.advancec
+			bn.Node.Advance()
+
+		case <-bn.triggerc:
+			bn.mu.Lock()
+			if len(bn.bftMsgs) > 0 {
+				rd := Ready{Messages: bn.bftMsgs}
+				bn.bftMsgs = nil
+				bn.mu.Unlock()
+				bn.readyc <- rd
+				<-bn.advancec
+			} else {
+				bn.mu.Unlock()
+			}
 		}
-		bn.mu.Unlock()
-		bn.readyc <- rd
 	}
 }
 
 func (bn *BFTNode) Ready() <-chan Ready { return bn.readyc }
 
 func (bn *BFTNode) Advance() {
-	bn.mu.Lock()
-	bn.bftMsgs = nil
-	bn.mu.Unlock()
-	bn.Node.Advance()
+	bn.advancec <- struct{}{}
 }
 
 func (bn *BFTNode) Tick() { bn.Node.Tick() }
@@ -208,6 +233,18 @@ func (bn *BFTNode) Step(ctx context.Context, m *pb.Message) error {
 	if m == nil {
 		return errors.New("cannot step with nil message")
 	}
+
+	defer func() {
+		bn.mu.Lock()
+		hasMsgs := len(bn.bftMsgs) > 0
+		bn.mu.Unlock()
+		if hasMsgs {
+			select {
+			case bn.triggerc <- struct{}{}:
+			default:
+			}
+		}
+	}()
 
 	if bn.isInternalMessage(m) {
 		return bn.Node.Step(ctx, *m)
@@ -227,9 +264,14 @@ func (bn *BFTNode) Step(ctx context.Context, m *pb.Message) error {
 				return err
 			}
 
-			// Leader tracks its own vote implicitly
 			key := bftSeqKey{view: bctx.View, seq: bctx.SeqNum}
 			bn.pp[key] = bctx.Digest
+
+			// Buffer the client payload locally
+			if len(m.Entries) > 0 {
+				bn.reqs[key] = m.Entries
+			}
+
 			if bn.prepares[key] == nil {
 				bn.prepares[key] = make(map[uint64]struct{})
 			}
@@ -260,6 +302,12 @@ func (bn *BFTNode) Step(ctx context.Context, m *pb.Message) error {
 		}
 
 		bn.pp[key] = bctx.Digest
+
+		// Buffer the payload received from the leader
+		if len(m.Entries) > 0 {
+			bn.reqs[key] = m.Entries
+		}
+
 		pMsg, err := bn.ConstructP(bctx)
 		if err != nil {
 			return err
@@ -269,7 +317,6 @@ func (bn *BFTNode) Step(ctx context.Context, m *pb.Message) error {
 			bn.prepares[key] = make(map[uint64]struct{})
 		}
 
-		// The PrePrepare counts as the Leader's Prepare vote
 		bn.prepares[key][m.From] = struct{}{}
 
 		wasBelow := uint64(len(bn.prepares[key])) < (2*bn.f + 1)
@@ -286,6 +333,15 @@ func (bn *BFTNode) Step(ctx context.Context, m *pb.Message) error {
 				}
 				bn.commits[key][bn.selfID] = struct{}{}
 				bn.broadcast(cMsg)
+
+				// Apply instantly if single node / f=0
+				if uint64(len(bn.commits[key])) >= (2*bn.f + 1) {
+					if entries, ok := bn.reqs[key]; ok {
+						for _, ent := range entries {
+							_ = bn.Node.Propose(ctx, ent.Data)
+						}
+					}
+				}
 			}
 		}
 
@@ -311,8 +367,8 @@ func (bn *BFTNode) Step(ctx context.Context, m *pb.Message) error {
 			bn.broadcast(cMsg)
 
 			if uint64(len(bn.commits[key])) >= (2*bn.f + 1) {
-				if len(m.Entries) > 0 {
-					for _, ent := range m.Entries {
+				if entries, ok := bn.reqs[key]; ok {
+					for _, ent := range entries {
 						_ = bn.Node.Propose(ctx, ent.Data)
 					}
 				}
@@ -329,8 +385,9 @@ func (bn *BFTNode) Step(ctx context.Context, m *pb.Message) error {
 		isAbove := uint64(len(bn.commits[key])) >= (2*bn.f + 1)
 
 		if wasBelow && isAbove {
-			if len(m.Entries) > 0 {
-				for _, ent := range m.Entries {
+			// Retrieve the buffered entries from PrePrepare step to execute
+			if entries, ok := bn.reqs[key]; ok {
+				for _, ent := range entries {
 					_ = bn.Node.Propose(ctx, ent.Data)
 				}
 			}
@@ -496,7 +553,6 @@ func (c *BFTClient) Tick() {
 	for ts, req := range c.pending {
 		req.ticks++
 		if req.ticks > 10 {
-			// Resign specific message payload with distinct target ID to preserve signature
 			for id := uint64(1); id <= c.n; id++ {
 				mCopy := req.msg
 				mCopy.To = id
@@ -616,7 +672,6 @@ func (c *BFTClient) verifyMessage(m *pb.Message) (int64, error) {
 	return ts, nil
 }
 
-// AddClientProof retained to satisfy interface contracts if natively injected directly
 func (c *BFTClient) AddClientProof(m *pb.Message) (int64, error) {
 	m.From = c.selfID
 	origCtx := normalizeContext(m.Context)
