@@ -2,8 +2,11 @@ package raft
 
 import (
 	"crypto/ed25519"
+	"crypto/sha256"
+	"encoding/binary"
 	"sync"
 
+	"google.golang.org/protobuf/proto"
 	pb "go.etcd.io/raft/v3/raftpb"
 )
 
@@ -100,25 +103,65 @@ func (b *BFTMessageBuilder) constructPhaseMessageAt(to uint64, bctx BFTContext, 
 // ConstructPrePrepare builds a signed PRE-PREPARE message:
 // <PRE-PREPARE, v, n, d, m>_sigma_p.
 func (b *BFTMessageBuilder) ConstructPrePrepare(to uint64, view uint64, seqNum uint64, request pb.Message) (BFTContext, pb.Message, int64, error) {
-	var op []byte
-	if len(request.GetEntries()) > 0 {
-		op = request.GetEntries()[0].GetData()
+	entries := cloneEntries(request.GetEntries())
+	digest, err := hashEntryBatch(entries)
+	if err != nil {
+		return BFTContext{}, pb.Message{}, 0, err
 	}
 
 	bctx := BFTContext{
 		Phase:  PhasePrePrepare,
 		View:   view,
 		SeqNum: seqNum,
-		Digest: hashData(op),
+		Digest: digest,
 	}
 
 	ts := b.nextTimestamp()
-	entries := cloneEntries(request.GetEntries())
 	m, err := b.constructPhaseMessageAt(to, bctx, entries, ts)
 	if err != nil {
 		return BFTContext{}, pb.Message{}, 0, err
 	}
 	return bctx, m, ts, nil
+}
+
+// hashEntryBatch hashes the complete entry batch deterministically, preserving
+// entry order and distinguishing nil entries from non-nil entries.
+func hashEntryBatch(entries []*pb.Entry) ([32]byte, error) {
+	h := sha256.New()
+	mo := proto.MarshalOptions{Deterministic: true}
+
+	var lenBuf [8]byte
+	binary.BigEndian.PutUint64(lenBuf[:], uint64(len(entries)))
+	if _, err := h.Write(lenBuf[:]); err != nil {
+		return [32]byte{}, err
+	}
+
+	for _, e := range entries {
+		if e == nil {
+			if _, err := h.Write([]byte{0}); err != nil {
+				return [32]byte{}, err
+			}
+			continue
+		}
+		if _, err := h.Write([]byte{1}); err != nil {
+			return [32]byte{}, err
+		}
+		eb, err := mo.Marshal(e)
+		if err != nil {
+			return [32]byte{}, err
+		}
+		binary.BigEndian.PutUint64(lenBuf[:], uint64(len(eb)))
+		if _, err := h.Write(lenBuf[:]); err != nil {
+			return [32]byte{}, err
+		}
+		if _, err := h.Write(eb); err != nil {
+			return [32]byte{}, err
+		}
+	}
+
+	var out [32]byte
+	copy(out[:], h.Sum(nil))
+	return out, nil
 }
 
 // ConstructPrepare builds a signed PREPARE message:

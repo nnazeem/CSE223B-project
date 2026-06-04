@@ -46,10 +46,12 @@ func TestBFTMessageBuilder_ConstructPrePrepare(t *testing.T) {
 	}
 	bctxPP, ppMsg, _, err := builder.ConstructPrePrepare(2, 7, 42, request)
 	require.NoError(t, err)
+	expectedDigest, err := hashEntryBatch(request.GetEntries())
+	require.NoError(t, err)
 	require.Equal(t, PhasePrePrepare, bctxPP.Phase)
 	require.Equal(t, uint64(7), bctxPP.View)
 	require.Equal(t, uint64(42), bctxPP.SeqNum)
-	require.Equal(t, hashData([]byte("write:k=v")), bctxPP.Digest)
+	require.Equal(t, expectedDigest, bctxPP.Digest)
 	require.Equal(t, pb.MsgApp, ppMsg.GetType())
 	require.Equal(t, uint64(1), ppMsg.GetFrom())
 	require.Equal(t, uint64(2), ppMsg.GetTo())
@@ -63,6 +65,38 @@ func TestBFTMessageBuilder_ConstructPrePrepare(t *testing.T) {
 	require.Equal(t, uint64(7), decodedPP.View)
 	require.Equal(t, uint64(42), decodedPP.SeqNum)
 	require.Equal(t, bctxPP.Digest, decodedPP.Digest)
+}
+
+func TestBFTMessageBuilder_ConstructPrePrepare_MultiEntryDigestCoversFullBatch(t *testing.T) {
+	_, priv, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+
+	now := time.Unix(1_700_000_003, 0)
+	builder := NewBFTMessageBuilder(1, priv, &ClientProofConfig{Now: func() time.Time { return now }})
+
+	requestA := pb.Message{
+		Type: pb.MsgProp.Enum(),
+		From: u64Ptr(100),
+		Entries: []*pb.Entry{
+			{Data: []byte("same-first")},
+			{Data: []byte("second-a")},
+		},
+	}
+	requestB := pb.Message{
+		Type: pb.MsgProp.Enum(),
+		From: u64Ptr(100),
+		Entries: []*pb.Entry{
+			{Data: []byte("same-first")},
+			{Data: []byte("second-b")},
+		},
+	}
+
+	bctxA, _, _, err := builder.ConstructPrePrepare(2, 7, 42, requestA)
+	require.NoError(t, err)
+	bctxB, _, _, err := builder.ConstructPrePrepare(2, 7, 42, requestB)
+	require.NoError(t, err)
+
+	require.NotEqual(t, bctxA.Digest, bctxB.Digest)
 }
 
 func TestBFTMessageBuilder_ConstructPrepare(t *testing.T) {
