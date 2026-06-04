@@ -184,6 +184,18 @@ func WrapBFTNode(
 	return bn
 }
 
+func (bn *BFTNode) signOutboundMessages(msgs []pb.Message) {
+	for i := range msgs {
+		ts := bn.cfg.now().UnixNano()
+		origCtx := normalizeContext(msgs[i].Context)
+		dataSign, err := messageSignBytes(&msgs[i], origCtx, ts)
+		if err == nil {
+			sig := ed25519.Sign(bn.priv, dataSign)
+			msgs[i].Context = packSignature(sig, ts, origCtx)
+		}
+	}
+}
+
 func (bn *BFTNode) forwardReady() {
 	for {
 		select {
@@ -197,6 +209,9 @@ func (bn *BFTNode) forwardReady() {
 				bn.bftMsgs = nil
 			}
 			bn.mu.Unlock()
+
+			bn.signOutboundMessages(rd.Messages)
+
 			bn.readyc <- rd
 			<-bn.advancec
 			bn.Node.Advance()
@@ -207,6 +222,9 @@ func (bn *BFTNode) forwardReady() {
 				rd := Ready{Messages: bn.bftMsgs}
 				bn.bftMsgs = nil
 				bn.mu.Unlock()
+
+				bn.signOutboundMessages(rd.Messages)
+
 				bn.readyc <- rd
 				<-bn.advancec
 			} else {
@@ -254,7 +272,7 @@ func (bn *BFTNode) Step(ctx context.Context, m *pb.Message) error {
 	}
 
 	var pendingProposals [][]byte
-	// Critical Section: BFT state update
+
 	bn.mu.Lock()
 
 	if bn.isClientRequest(m) {
@@ -262,7 +280,7 @@ func (bn *BFTNode) Step(ctx context.Context, m *pb.Message) error {
 			bctx, ppMsg, err := bn.ConstructPP(m)
 			if err != nil {
 				bn.mu.Unlock()
-				return err // Must unlock before returning!
+				return err
 			}
 
 			key := bftSeqKey{view: bctx.View, seq: bctx.SeqNum}
@@ -279,14 +297,15 @@ func (bn *BFTNode) Step(ctx context.Context, m *pb.Message) error {
 
 			bn.broadcast(ppMsg)
 		}
-		bn.mu.Unlock() // Unlock before return
+		bn.mu.Unlock()
 		return nil
 	}
 
 	bctx, err := decodeBFTContext(m.Context)
-	if err != nil {
-		bn.mu.Unlock()               // Unlock before return
-		return bn.Node.Step(ctx, *m) // Hand off to Raft
+	// TUNNEL: Pass authenticated native Raft traffic to the inner core!
+	if err != nil || bctx.Phase == PhaseUnknown {
+		bn.mu.Unlock()
+		return bn.Node.Step(ctx, *m)
 	}
 
 	key := bftSeqKey{view: bctx.View, seq: bctx.SeqNum}
@@ -294,15 +313,15 @@ func (bn *BFTNode) Step(ctx context.Context, m *pb.Message) error {
 	switch bctx.Phase {
 	case PhasePrePrepare:
 		if bctx.View != bn.view {
-			bn.mu.Unlock() // Unlock before return
+			bn.mu.Unlock()
 			return errors.New("view mismatch")
 		}
 		if bctx.SeqNum <= bn.lowW || bctx.SeqNum > bn.highW {
-			bn.mu.Unlock() // Unlock before return
+			bn.mu.Unlock()
 			return errors.New("sequence number out of bounds")
 		}
 		if existing, exists := bn.pp[key]; exists && existing != bctx.Digest {
-			bn.mu.Unlock() // Unlock before return
+			bn.mu.Unlock()
 			return errors.New("conflicting pre-prepare digest")
 		}
 
@@ -314,7 +333,7 @@ func (bn *BFTNode) Step(ctx context.Context, m *pb.Message) error {
 
 		pMsg, err := bn.ConstructP(bctx)
 		if err != nil {
-			bn.mu.Unlock() // Unlock before return
+			bn.mu.Unlock()
 			return err
 		}
 
@@ -332,7 +351,7 @@ func (bn *BFTNode) Step(ctx context.Context, m *pb.Message) error {
 		if wasBelow && isAbove {
 			cMsg, err := bn.ConstructC(bctx)
 			if err != nil {
-				bn.mu.Unlock() // Unlock before return
+				bn.mu.Unlock()
 				return err
 			}
 
@@ -363,7 +382,7 @@ func (bn *BFTNode) Step(ctx context.Context, m *pb.Message) error {
 		if wasBelow && isAbove {
 			cMsg, err := bn.ConstructC(bctx)
 			if err != nil {
-				bn.mu.Unlock() // Unlock before return
+				bn.mu.Unlock()
 				return err
 			}
 
@@ -400,9 +419,8 @@ func (bn *BFTNode) Step(ctx context.Context, m *pb.Message) error {
 		}
 	}
 
-	// Give up lock before working w/ channels or Raft APIs
 	bn.mu.Unlock()
-	// Propsose w/o locking a wrapper
+
 	for _, data := range pendingProposals {
 		go func(d []byte) {
 			_ = bn.Node.Propose(context.Background(), d)

@@ -104,7 +104,7 @@ func TestBFT_Node_PrepareQuorum(t *testing.T) {
 
 	rd := <-node.Ready()
 	require.NotEmpty(t, rd.Messages)
-	node.Advance() // Consumer loop unconditional advance
+	node.Advance()
 
 	bctx.Phase = PhasePrepare
 	encPCtx, _ := encodeBFTContext(bctx)
@@ -122,7 +122,11 @@ func TestBFT_Node_PrepareQuorum(t *testing.T) {
 	require.NotEmpty(t, rd2.Messages)
 	node.Advance()
 
-	cCtx, _ := decodeBFTContext(rd2.Messages[0].Context)
+	// Strip the outbound signature to verify inner contents
+	_, cOrigCtx, err := VerifyBFTMessageSignature(&rd2.Messages[0], node.nodePubKeys[1])
+	require.NoError(t, err)
+
+	cCtx, _ := decodeBFTContext(cOrigCtx)
 	require.Equal(t, PhaseCommit, cCtx.Phase)
 }
 
@@ -189,7 +193,8 @@ func TestBFT_Node_ImpossibleQuorum(t *testing.T) {
 	select {
 	case rd := <-node.Ready():
 		if len(rd.Messages) > 0 {
-			cCtx, _ := decodeBFTContext(rd.Messages[0].Context)
+			_, origCtx, _ := VerifyBFTMessageSignature(&rd.Messages[0], node.nodePubKeys[1])
+			cCtx, _ := decodeBFTContext(origCtx)
 			require.NotEqual(t, PhaseCommit, cCtx.Phase, "Node emitted Commit without reaching Quorum!")
 		}
 	case <-time.After(50 * time.Millisecond):
@@ -343,13 +348,12 @@ func TestBFT_Integration_RealRaftNode(t *testing.T) {
 						}
 					}
 				}
-
 				bftNode.Advance()
 			}
 		}
 	}()
 
-	// 1. Induce natural Raft leader election via ticks to prevent Race Conditions
+	// TODO Leader election/View Change: Using natural ticks to elect leader instead of forcing Campaign
 WaitLeader:
 	for {
 		bftNode.Tick()
@@ -360,7 +364,6 @@ WaitLeader:
 		}
 	}
 
-	// Give the async loop a fraction of a second to fully clear the Ready channel
 	time.Sleep(50 * time.Millisecond)
 
 	// 2. Submit BFT Client Proposal
@@ -375,7 +378,8 @@ WaitLeader:
 	// 3. Catch outbound PhasePrePrepare (Drain 3 messages sent to peers 2, 3, and 4)
 	for i := 0; i < 3; i++ {
 		ppMsg := <-outboundMsgs
-		bctx, err := decodeBFTContext(ppMsg.Context)
+		_, origCtx, _ := VerifyBFTMessageSignature(&ppMsg, nodePubs[1])
+		bctx, err := decodeBFTContext(origCtx)
 		require.NoError(t, err)
 		require.Equal(t, PhasePrePrepare, bctx.Phase)
 	}
@@ -393,7 +397,8 @@ WaitLeader:
 	// 5. Catch outbound PhaseCommit (Drain 3 messages sent to peers 2, 3, and 4)
 	for i := 0; i < 3; i++ {
 		cMsgOut := <-outboundMsgs
-		cCtx, _ := decodeBFTContext(cMsgOut.Context)
+		_, origCtx, _ := VerifyBFTMessageSignature(&cMsgOut, nodePubs[1])
+		cCtx, _ := decodeBFTContext(origCtx)
 		require.Equal(t, PhaseCommit, cCtx.Phase)
 	}
 
@@ -413,5 +418,144 @@ WaitLeader:
 		// Success!
 	case <-time.After(2 * time.Second):
 		t.Fatal("Timeout waiting for payload to execute on internal Raft log")
+	}
+}
+
+// Integration Test w/ Real Multi-Node Cluster and Network Router
+func TestBFT_Integration_RealRaftNetwork(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	clientPub, clientPriv, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+
+	nodePubs := make(map[uint64]ed25519.PublicKey)
+	nodePrivs := make(map[uint64]ed25519.PrivateKey)
+	for i := uint64(1); i <= 4; i++ {
+		pub, priv, _ := ed25519.GenerateKey(nil)
+		nodePubs[i] = pub
+		nodePrivs[i] = priv
+	}
+
+	clientIDs := []uint64{100}
+	cfg := &ClientProofConfig{MaxAge: 30 * time.Second, Now: time.Now}
+
+	nodes := make(map[uint64]*BFTNode)
+	storages := make(map[uint64]*MemoryStorage)
+	peers := []Peer{{ID: 1}, {ID: 2}, {ID: 3}, {ID: 4}}
+
+	for i := uint64(1); i <= 4; i++ {
+		storage := NewMemoryStorage()
+		raftCfg := &Config{
+			ID:              i,
+			ElectionTick:    10,
+			HeartbeatTick:   1,
+			Storage:         storage,
+			MaxSizePerMsg:   4096,
+			MaxInflightMsgs: 256,
+		}
+
+		realNode := StartNode(raftCfg, peers)
+		defer realNode.Stop()
+		storages[i] = storage
+		nodes[i] = WrapBFTNode(realNode, i, 4, nodePrivs[i], nodePubs, clientIDs, clientPub, cfg)
+	}
+
+	bftClient := NewBFTClient(100, 4, clientPriv, nodePubs, clientIDs, clientPub, cfg)
+
+	msgRouter := make(chan pb.Message, 1000)
+	successTracker := make(chan bool, 1)
+	leaderChan := make(chan uint64, 10)
+
+	for id, bn := range nodes {
+		go func(nodeID uint64, bftN *BFTNode, store *MemoryStorage) {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case rd, ok := <-bftN.Ready():
+					if !ok {
+						return
+					}
+
+					if rd.SoftState != nil && rd.SoftState.Lead != 0 {
+						select {
+						case leaderChan <- rd.SoftState.Lead:
+						default:
+						}
+					}
+
+					if len(rd.Entries) > 0 {
+						store.Append(rd.Entries)
+					}
+
+					for _, m := range rd.Messages {
+						msgRouter <- m
+					}
+
+					for _, ent := range rd.CommittedEntries {
+						if ent.Type == pb.EntryConfChange {
+							var cc pb.ConfChange
+							cc.Unmarshal(ent.Data)
+							bftN.ApplyConfChange(cc)
+						} else if ent.Type == pb.EntryNormal && len(ent.Data) > 0 {
+							if string(ent.Data) == "integration-test-data" {
+								select {
+								case successTracker <- true:
+								default:
+								}
+							}
+						}
+					}
+					bftN.Advance()
+				}
+			}
+		}(id, bn, storages[id])
+	}
+
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case m := <-msgRouter:
+				if targetNode, exists := nodes[m.To]; exists {
+					go func(msg pb.Message) {
+						_ = targetNode.Step(ctx, &msg)
+					}(m)
+				}
+			}
+		}
+	}()
+
+	var leaderID uint64
+WaitLeader:
+	for {
+		for _, bn := range nodes {
+			bn.Tick()
+		}
+		select {
+		case leaderID = <-leaderChan:
+			break WaitLeader
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	payloadData := []byte("integration-test-data")
+	err = bftClient.Propose(ctx, payloadData)
+	require.NoError(t, err)
+
+	clientMsg := <-bftClient.Ready()
+
+	err = nodes[leaderID].Step(ctx, &clientMsg)
+	require.NoError(t, err)
+
+	select {
+	case <-successTracker:
+		// Success!
+	case <-time.After(3 * time.Second):
+		t.Fatal("Timeout: The simulated 4-Node network failed to reach consensus.")
 	}
 }
