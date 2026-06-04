@@ -1,4 +1,3 @@
-// with VSCode Agent Chat
 package raft
 
 import (
@@ -76,24 +75,21 @@ func TestBFT_Client_ReplayAttack(t *testing.T) {
 	node, client, _, _ := setupCluster(t)
 	ctx := context.Background()
 
-	// Intercept a valid client proposal
 	err := client.Propose(ctx, []byte("data"))
 	require.NoError(t, err)
 	propMsg := <-client.Ready()
 
-	// 1. Process it once (Pass a Clone so the original is untouched)
 	msg1 := proto.Clone(&propMsg).(*pb.Message)
 	err = node.Step(ctx, msg1)
 	require.NoError(t, err)
 
-	// 2. Process exact same payload again (Should Fail due to timestamp tracking)
 	msg2 := proto.Clone(&propMsg).(*pb.Message)
 	err = node.Step(ctx, msg2)
 	require.ErrorIs(t, err, ErrStaleMessage)
 }
 
 func TestBFT_Node_PrepareQuorum(t *testing.T) {
-	node, _, nodePrivs, _ := setupCluster(t)
+	node, _, nodePrivs, mock := setupCluster(t)
 	ctx := context.Background()
 
 	bctx := BFTContext{Phase: PhasePrePrepare, View: 0, SeqNum: 1, Digest: hashData([]byte("test"))}
@@ -106,15 +102,13 @@ func TestBFT_Node_PrepareQuorum(t *testing.T) {
 
 	_ = node.Step(ctx, msg)
 
-	// FIX: Must catch the PhasePrepare broadcast before calling Advance!
-	<-node.Ready()
-	node.Advance()
+	rd := <-node.Ready()
+	require.NotEmpty(t, rd.Messages)
+	node.Advance() // Consumer loop unconditional advance
 
 	bctx.Phase = PhasePrepare
 	encPCtx, _ := encodeBFTContext(bctx)
 
-	// Since f=1, 2f+1 requires 3. Node processed 1 PrePrepare and self-voted (count=2).
-	// We inject ONE more peer Prepare to hit threshold 3.
 	pMsg := &pb.Message{Type: pb.MsgApp, From: 3, Term: 1, Context: encPCtx}
 	origPCtx := normalizeContext(pMsg.Context)
 	pData, _ := messageSignBytes(pMsg, origPCtx, 200)
@@ -123,11 +117,12 @@ func TestBFT_Node_PrepareQuorum(t *testing.T) {
 	err := node.Step(ctx, pMsg)
 	require.NoError(t, err)
 
-	// FIX: The triggerc multiplexer automatically flushes the Commit message!
-	rd := <-node.Ready()
-	require.NotEmpty(t, rd.Messages)
+	mock.readyc <- Ready{}
+	rd2 := <-node.Ready()
+	require.NotEmpty(t, rd2.Messages)
+	node.Advance()
 
-	cCtx, _ := decodeBFTContext(rd.Messages[0].Context)
+	cCtx, _ := decodeBFTContext(rd2.Messages[0].Context)
 	require.Equal(t, PhaseCommit, cCtx.Phase)
 }
 
@@ -139,7 +134,6 @@ func TestBFT_Node_EquivocatingLeader(t *testing.T) {
 	node, _, nodePrivs, _ := setupCluster(t)
 	ctx := context.Background()
 
-	// Leader sends PrePrepare with Digest A
 	bctxA := BFTContext{Phase: PhasePrePrepare, View: 0, SeqNum: 1, Digest: hashData([]byte("A"))}
 	encA, _ := encodeBFTContext(bctxA)
 	msgA := &pb.Message{Type: pb.MsgApp, From: 2, Term: 1, Context: encA}
@@ -149,7 +143,6 @@ func TestBFT_Node_EquivocatingLeader(t *testing.T) {
 	err := node.Step(ctx, msgA)
 	require.NoError(t, err)
 
-	// Malicious Leader tries to equivocate with Digest B for the same Sequence Number
 	bctxB := BFTContext{Phase: PhasePrePrepare, View: 0, SeqNum: 1, Digest: hashData([]byte("B"))}
 	encB, _ := encodeBFTContext(bctxB)
 	msgB := &pb.Message{Type: pb.MsgApp, From: 2, Term: 1, Context: encB}
@@ -165,7 +158,6 @@ func TestBFT_Node_OutOfBoundsSequence(t *testing.T) {
 	node, _, nodePrivs, _ := setupCluster(t)
 	ctx := context.Background()
 
-	// Sequence Number 9999 is far above highW (2000)
 	bctx := BFTContext{Phase: PhasePrePrepare, View: 0, SeqNum: 9999, Digest: hashData([]byte("data"))}
 	enc, _ := encodeBFTContext(bctx)
 	msg := &pb.Message{Type: pb.MsgApp, From: 2, Term: 1, Context: enc}
@@ -178,7 +170,7 @@ func TestBFT_Node_OutOfBoundsSequence(t *testing.T) {
 }
 
 func TestBFT_Node_ImpossibleQuorum(t *testing.T) {
-	node, _, nodePrivs, _ := setupCluster(t)
+	node, _, nodePrivs, mock := setupCluster(t)
 	ctx := context.Background()
 
 	bctx := BFTContext{Phase: PhasePrePrepare, View: 0, SeqNum: 1, Digest: hashData([]byte("test"))}
@@ -188,12 +180,11 @@ func TestBFT_Node_ImpossibleQuorum(t *testing.T) {
 	data, _ := messageSignBytes(msg, encCtx, 100)
 	msg.Context = packSignature(ed25519.Sign(nodePrivs[2], data), 100, encCtx)
 
-	// Leader and Self Vote -> 2 Votes total (Needs 3 for Quorum)
 	_ = node.Step(ctx, msg)
-
-	// FIX: Catch the PhasePrepare broadcast before calling Advance!
 	<-node.Ready()
 	node.Advance()
+
+	mock.readyc <- Ready{}
 
 	select {
 	case rd := <-node.Ready():
@@ -202,7 +193,7 @@ func TestBFT_Node_ImpossibleQuorum(t *testing.T) {
 			require.NotEqual(t, PhaseCommit, cCtx.Phase, "Node emitted Commit without reaching Quorum!")
 		}
 	case <-time.After(50 * time.Millisecond):
-		// Test Passed: Expected deadlock/halt behavior due to insufficient peers for 2f+1
+		// Test Passed: Expected halt due to insufficient peers
 	}
 }
 
@@ -264,10 +255,8 @@ func TestBFT_Client_ConsensusQuorum(t *testing.T) {
 	require.Equal(t, []byte("success"), result)
 }
 
-// Integration Test w/ etcd Raft Node
+// Integration Test w/ Real etcd Raft Node and Asynchronous Consumer
 func TestBFT_Integration_RealRaftNode(t *testing.T) {
-	ctx := context.Background()
-
 	pubC, privC, err := ed25519.GenerateKey(nil)
 	require.NoError(t, err)
 
@@ -292,9 +281,7 @@ func TestBFT_Integration_RealRaftNode(t *testing.T) {
 		MaxInflightMsgs: 256,
 	}
 
-	// Single node cluster bypasses "pending config change" limits
 	peers := []Peer{{ID: 1}}
-
 	realNode := StartNode(raftCfg, peers)
 	defer realNode.Stop()
 
@@ -308,54 +295,94 @@ func TestBFT_Integration_RealRaftNode(t *testing.T) {
 		m.Context = packSignature(ed25519.Sign(priv, data), ts, origCtx)
 	}
 
-	// Drain initial setup and ConfChange
-	rd := <-bftNode.Ready()
-	storage.Append(rd.Entries)
-	for _, ent := range rd.CommittedEntries {
-		if ent.Type == pb.EntryConfChange {
-			var cc pb.ConfChange
-			cc.Unmarshal(ent.Data)
-			bftNode.ApplyConfChange(cc)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	outboundMsgs := make(chan pb.Message, 100)
+	success := make(chan bool, 1)
+	isLeader := make(chan bool, 1)
+
+	// ==============================================================
+	// Asynchronous Consumer Loop
+	// ==============================================================
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case rd, ok := <-bftNode.Ready():
+				if !ok {
+					return
+				}
+
+				if rd.SoftState != nil && rd.SoftState.Lead == 1 {
+					select {
+					case isLeader <- true:
+					default:
+					}
+				}
+
+				if len(rd.Entries) > 0 {
+					storage.Append(rd.Entries)
+				}
+
+				for _, m := range rd.Messages {
+					outboundMsgs <- m
+				}
+
+				for _, ent := range rd.CommittedEntries {
+					if ent.Type == pb.EntryConfChange {
+						var cc pb.ConfChange
+						cc.Unmarshal(ent.Data)
+						bftNode.ApplyConfChange(cc)
+					} else if ent.Type == pb.EntryNormal && len(ent.Data) > 0 {
+						if string(ent.Data) == "integration-test-data" {
+							select {
+							case success <- true:
+							default:
+							}
+						}
+					}
+				}
+
+				bftNode.Advance()
+			}
+		}
+	}()
+
+	// 1. Induce natural Raft leader election via ticks to prevent Race Conditions
+WaitLeader:
+	for {
+		bftNode.Tick()
+		select {
+		case <-isLeader:
+			break WaitLeader
+		case <-time.After(10 * time.Millisecond):
 		}
 	}
-	bftNode.Advance()
 
-	// Become Raft Leader
-	err = bftNode.Campaign(ctx)
-	require.NoError(t, err)
+	// Give the async loop a fraction of a second to fully clear the Ready channel
+	time.Sleep(50 * time.Millisecond)
 
-	// Drain Campaign Success payload
-	rd = <-bftNode.Ready()
-	storage.Append(rd.Entries)
-	bftNode.Advance()
-
-	// ==============================================================
-	// STAGE 2: BFT Client Proposal & Consensus
-	// ==============================================================
+	// 2. Submit BFT Client Proposal
 	payloadData := []byte("integration-test-data")
 	err = bftClient.Propose(ctx, payloadData)
 	require.NoError(t, err)
 
 	clientMsg := <-bftClient.Ready()
-
 	err = bftNode.Step(ctx, &clientMsg)
 	require.NoError(t, err)
 
-	// Pull BFT PrePrepare Broadcast
-	rd = <-bftNode.Ready()
-	require.NotEmpty(t, rd.Messages)
+	// 3. Catch outbound PhasePrePrepare (Drain 3 messages sent to peers 2, 3, and 4)
+	for i := 0; i < 3; i++ {
+		ppMsg := <-outboundMsgs
+		bctx, err := decodeBFTContext(ppMsg.Context)
+		require.NoError(t, err)
+		require.Equal(t, PhasePrePrepare, bctx.Phase)
+	}
 
-	ppMsg := rd.Messages[0]
-	bctx, err := decodeBFTContext(ppMsg.Context)
-	require.NoError(t, err)
-	require.Equal(t, PhasePrePrepare, bctx.Phase)
-
-	bftNode.Advance()
-
-	// Inject Peer Prepares
-	bctx.Phase = PhasePrepare
+	// 4. Inject 2x Peer PhasePrepares
+	bctx := BFTContext{Phase: PhasePrepare, View: 0, SeqNum: 1, Digest: hashData(payloadData)}
 	encPCtx, _ := encodeBFTContext(bctx)
-
 	for i := uint64(2); i <= 3; i++ {
 		pMsg := &pb.Message{Type: pb.MsgApp, From: i, Term: 1, Context: encPCtx}
 		signPeerMsg(pMsg, nodePrivs[i])
@@ -363,17 +390,16 @@ func TestBFT_Integration_RealRaftNode(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	// Pull BFT Commit Broadcast
-	rd = <-bftNode.Ready()
-	require.NotEmpty(t, rd.Messages)
-	cCtx, _ := decodeBFTContext(rd.Messages[0].Context)
-	require.Equal(t, PhaseCommit, cCtx.Phase)
-	bftNode.Advance()
+	// 5. Catch outbound PhaseCommit (Drain 3 messages sent to peers 2, 3, and 4)
+	for i := 0; i < 3; i++ {
+		cMsgOut := <-outboundMsgs
+		cCtx, _ := decodeBFTContext(cMsgOut.Context)
+		require.Equal(t, PhaseCommit, cCtx.Phase)
+	}
 
-	// Inject Peer Commits
+	// 6. Inject 2x Peer PhaseCommits
 	bctx.Phase = PhaseCommit
 	encCCtx, _ := encodeBFTContext(bctx)
-
 	for i := uint64(2); i <= 3; i++ {
 		cMsg := &pb.Message{Type: pb.MsgApp, From: i, Term: 1, Context: encCCtx}
 		signPeerMsg(cMsg, nodePrivs[i])
@@ -381,11 +407,11 @@ func TestBFT_Integration_RealRaftNode(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	// Validate BFTNode called realNode.Propose
-	rd = <-bftNode.Ready()
-	require.NotEmpty(t, rd.Entries, "Real Raft node should have appended the entry to its log")
-	require.Equal(t, payloadData, rd.Entries[0].Data, "The client payload should match the internal Raft entry data")
-
-	storage.Append(rd.Entries)
-	bftNode.Advance()
+	// 7. Wait for Real Raft Log Confirmation
+	select {
+	case <-success:
+		// Success!
+	case <-time.After(2 * time.Second):
+		t.Fatal("Timeout waiting for payload to execute on internal Raft log")
+	}
 }

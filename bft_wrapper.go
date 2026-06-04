@@ -1,4 +1,3 @@
-// with VSCode Agent Chat
 package raft
 
 import (
@@ -254,20 +253,21 @@ func (bn *BFTNode) Step(ctx context.Context, m *pb.Message) error {
 		return err
 	}
 
+	var pendingProposals [][]byte
+	// Critical Section: BFT state update
 	bn.mu.Lock()
-	defer bn.mu.Unlock()
 
 	if bn.isClientRequest(m) {
 		if bn.isLeader() {
 			bctx, ppMsg, err := bn.ConstructPP(m)
 			if err != nil {
-				return err
+				bn.mu.Unlock()
+				return err // Must unlock before returning!
 			}
 
 			key := bftSeqKey{view: bctx.View, seq: bctx.SeqNum}
 			bn.pp[key] = bctx.Digest
 
-			// Buffer the client payload locally
 			if len(m.Entries) > 0 {
 				bn.reqs[key] = m.Entries
 			}
@@ -279,12 +279,14 @@ func (bn *BFTNode) Step(ctx context.Context, m *pb.Message) error {
 
 			bn.broadcast(ppMsg)
 		}
+		bn.mu.Unlock() // Unlock before return
 		return nil
 	}
 
 	bctx, err := decodeBFTContext(m.Context)
 	if err != nil {
-		return bn.Node.Step(ctx, *m)
+		bn.mu.Unlock()               // Unlock before return
+		return bn.Node.Step(ctx, *m) // Hand off to Raft
 	}
 
 	key := bftSeqKey{view: bctx.View, seq: bctx.SeqNum}
@@ -292,24 +294,27 @@ func (bn *BFTNode) Step(ctx context.Context, m *pb.Message) error {
 	switch bctx.Phase {
 	case PhasePrePrepare:
 		if bctx.View != bn.view {
+			bn.mu.Unlock() // Unlock before return
 			return errors.New("view mismatch")
 		}
 		if bctx.SeqNum <= bn.lowW || bctx.SeqNum > bn.highW {
+			bn.mu.Unlock() // Unlock before return
 			return errors.New("sequence number out of bounds")
 		}
 		if existing, exists := bn.pp[key]; exists && existing != bctx.Digest {
+			bn.mu.Unlock() // Unlock before return
 			return errors.New("conflicting pre-prepare digest")
 		}
 
 		bn.pp[key] = bctx.Digest
 
-		// Buffer the payload received from the leader
 		if len(m.Entries) > 0 {
 			bn.reqs[key] = m.Entries
 		}
 
 		pMsg, err := bn.ConstructP(bctx)
 		if err != nil {
+			bn.mu.Unlock() // Unlock before return
 			return err
 		}
 
@@ -318,7 +323,6 @@ func (bn *BFTNode) Step(ctx context.Context, m *pb.Message) error {
 		}
 
 		bn.prepares[key][m.From] = struct{}{}
-
 		wasBelow := uint64(len(bn.prepares[key])) < (2*bn.f + 1)
 		bn.prepares[key][bn.selfID] = struct{}{} // Self-vote
 		isAbove := uint64(len(bn.prepares[key])) >= (2*bn.f + 1)
@@ -327,19 +331,21 @@ func (bn *BFTNode) Step(ctx context.Context, m *pb.Message) error {
 
 		if wasBelow && isAbove {
 			cMsg, err := bn.ConstructC(bctx)
-			if err == nil {
-				if bn.commits[key] == nil {
-					bn.commits[key] = make(map[uint64]struct{})
-				}
-				bn.commits[key][bn.selfID] = struct{}{}
-				bn.broadcast(cMsg)
+			if err != nil {
+				bn.mu.Unlock() // Unlock before return
+				return err
+			}
 
-				// Apply instantly if single node / f=0
-				if uint64(len(bn.commits[key])) >= (2*bn.f + 1) {
-					if entries, ok := bn.reqs[key]; ok {
-						for _, ent := range entries {
-							_ = bn.Node.Propose(ctx, ent.Data)
-						}
+			if bn.commits[key] == nil {
+				bn.commits[key] = make(map[uint64]struct{})
+			}
+			bn.commits[key][bn.selfID] = struct{}{}
+			bn.broadcast(cMsg)
+
+			if uint64(len(bn.commits[key])) >= (2*bn.f + 1) {
+				if entries, ok := bn.reqs[key]; ok {
+					for _, ent := range entries {
+						pendingProposals = append(pendingProposals, ent.Data)
 					}
 				}
 			}
@@ -357,6 +363,7 @@ func (bn *BFTNode) Step(ctx context.Context, m *pb.Message) error {
 		if wasBelow && isAbove {
 			cMsg, err := bn.ConstructC(bctx)
 			if err != nil {
+				bn.mu.Unlock() // Unlock before return
 				return err
 			}
 
@@ -369,7 +376,7 @@ func (bn *BFTNode) Step(ctx context.Context, m *pb.Message) error {
 			if uint64(len(bn.commits[key])) >= (2*bn.f + 1) {
 				if entries, ok := bn.reqs[key]; ok {
 					for _, ent := range entries {
-						_ = bn.Node.Propose(ctx, ent.Data)
+						pendingProposals = append(pendingProposals, ent.Data)
 					}
 				}
 			}
@@ -385,13 +392,21 @@ func (bn *BFTNode) Step(ctx context.Context, m *pb.Message) error {
 		isAbove := uint64(len(bn.commits[key])) >= (2*bn.f + 1)
 
 		if wasBelow && isAbove {
-			// Retrieve the buffered entries from PrePrepare step to execute
 			if entries, ok := bn.reqs[key]; ok {
 				for _, ent := range entries {
-					_ = bn.Node.Propose(ctx, ent.Data)
+					pendingProposals = append(pendingProposals, ent.Data)
 				}
 			}
 		}
+	}
+
+	// Give up lock before working w/ channels or Raft APIs
+	bn.mu.Unlock()
+	// Propsose w/o locking a wrapper
+	for _, data := range pendingProposals {
+		go func(d []byte) {
+			_ = bn.Node.Propose(context.Background(), d)
+		}(data)
 	}
 
 	return nil
