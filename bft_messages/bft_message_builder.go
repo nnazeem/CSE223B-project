@@ -247,6 +247,7 @@ func (b *BFTMessageBuilder) ConstructViewChange(
 
 // ConstructNewView builds a signed NEW-VIEW message:
 // <NEW-VIEW, v, V, O>_sigma_p.
+// v should be the new view number, V should be the set of view-change messages received from a quorum of replicas, and O should be the set of pre-prepare messages that the new primary is proposing for the new view.
 func (b *BFTMessageBuilder) ConstructNewView(
 	to uint64,
 	view uint64,
