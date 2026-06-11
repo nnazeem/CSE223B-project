@@ -19,6 +19,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/proto"
 
 	pb "go.etcd.io/raft/v3/raftpb"
 )
@@ -61,7 +62,7 @@ func TestStorageEntries(t *testing.T) {
 		lo, hi, maxsize uint64
 
 		werr     error
-		wentries []pb.Entry
+		wentries []*pb.Entry
 	}{
 		{2, 6, math.MaxUint64, ErrCompacted, nil},
 		{3, 4, math.MaxUint64, ErrCompacted, nil},
@@ -71,12 +72,12 @@ func TestStorageEntries(t *testing.T) {
 		// even if maxsize is zero, the first entry should be returned
 		{4, 7, 0, nil, index(4).terms(4)},
 		// limit to 2
-		{4, 7, uint64(ents[1].Size() + ents[2].Size()), nil, index(4).terms(4, 5)},
+		{4, 7, uint64(proto.Size(ents[1]) + proto.Size(ents[2])), nil, index(4).terms(4, 5)},
 		// limit to 2
-		{4, 7, uint64(ents[1].Size() + ents[2].Size() + ents[3].Size()/2), nil, index(4).terms(4, 5)},
-		{4, 7, uint64(ents[1].Size() + ents[2].Size() + ents[3].Size() - 1), nil, index(4).terms(4, 5)},
+		{4, 7, uint64(proto.Size(ents[1]) + proto.Size(ents[2]) + proto.Size(ents[3])/2), nil, index(4).terms(4, 5)},
+		{4, 7, uint64(proto.Size(ents[1]) + proto.Size(ents[2]) + proto.Size(ents[3]) - 1), nil, index(4).terms(4, 5)},
 		// all
-		{4, 7, uint64(ents[1].Size() + ents[2].Size() + ents[3].Size()), nil, index(4).terms(4, 5, 6)},
+		{4, 7, uint64(proto.Size(ents[1]) + proto.Size(ents[2]) + proto.Size(ents[3])), nil, index(4).terms(4, 5, 6)},
 	}
 
 	for _, tt := range tests {
@@ -84,7 +85,7 @@ func TestStorageEntries(t *testing.T) {
 			s := &MemoryStorage{ents: ents}
 			entries, err := s.Entries(tt.lo, tt.hi, tt.maxsize)
 			require.Equal(t, tt.werr, err)
-			require.Equal(t, tt.wentries, entries)
+			requireEqualEntries(t, tt.wentries, entries)
 		})
 	}
 }
@@ -137,8 +138,8 @@ func TestStorageCompact(t *testing.T) {
 		t.Run("", func(t *testing.T) {
 			s := &MemoryStorage{ents: ents}
 			require.Equal(t, tt.werr, s.Compact(tt.i))
-			require.Equal(t, tt.windex, s.ents[0].Index)
-			require.Equal(t, tt.wterm, s.ents[0].Term)
+			require.Equal(t, tt.windex, s.ents[0].GetIndex())
+			require.Equal(t, tt.wterm, s.ents[0].GetTerm())
 			require.Equal(t, tt.wlen, len(s.ents))
 		})
 	}
@@ -153,10 +154,10 @@ func TestStorageCreateSnapshot(t *testing.T) {
 		i uint64
 
 		werr  error
-		wsnap pb.Snapshot
+		wsnap *pb.Snapshot
 	}{
-		{4, nil, pb.Snapshot{Data: data, Metadata: pb.SnapshotMetadata{Index: 4, Term: 4, ConfState: *cs}}},
-		{5, nil, pb.Snapshot{Data: data, Metadata: pb.SnapshotMetadata{Index: 5, Term: 5, ConfState: *cs}}},
+		{4, nil, &pb.Snapshot{Data: data, Metadata: &pb.SnapshotMetadata{Index: new(uint64(4)), Term: new(uint64(4)), ConfState: &pb.ConfState{Voters: []uint64{1, 2, 3}}}}},
+		{5, nil, &pb.Snapshot{Data: data, Metadata: &pb.SnapshotMetadata{Index: new(uint64(5)), Term: new(uint64(5)), ConfState: &pb.ConfState{Voters: []uint64{1, 2, 3}}}}},
 	}
 
 	for _, tt := range tests {
@@ -164,7 +165,7 @@ func TestStorageCreateSnapshot(t *testing.T) {
 			s := &MemoryStorage{ents: ents}
 			snap, err := s.CreateSnapshot(tt.i, cs, data)
 			require.Equal(t, tt.werr, err)
-			require.Equal(t, tt.wsnap, snap)
+			require.True(t, proto.Equal(tt.wsnap, snap))
 		})
 	}
 }
@@ -172,10 +173,10 @@ func TestStorageCreateSnapshot(t *testing.T) {
 func TestStorageAppend(t *testing.T) {
 	ents := index(3).terms(3, 4, 5)
 	tests := []struct {
-		entries []pb.Entry
+		entries []*pb.Entry
 
 		werr     error
-		wentries []pb.Entry
+		wentries []*pb.Entry
 	}{
 		{
 			index(1).terms(1, 2),
@@ -230,18 +231,47 @@ func TestStorageApplySnapshot(t *testing.T) {
 	cs := &pb.ConfState{Voters: []uint64{1, 2, 3}}
 	data := []byte("data")
 
-	tests := []pb.Snapshot{{Data: data, Metadata: pb.SnapshotMetadata{Index: 4, Term: 4, ConfState: *cs}},
-		{Data: data, Metadata: pb.SnapshotMetadata{Index: 3, Term: 3, ConfState: *cs}},
+	testCases := []struct {
+		name          string
+		snapshots     []*pb.Snapshot
+		expectedError error
+	}{
+		{
+			name: "normal case",
+			snapshots: []*pb.Snapshot{
+				{Data: data, Metadata: &pb.SnapshotMetadata{Index: new(uint64(4)), Term: new(uint64(4)), ConfState: cs}},
+			},
+			expectedError: nil,
+		},
+		{
+			name: "snapshot out of date",
+			snapshots: []*pb.Snapshot{
+				{Data: data, Metadata: &pb.SnapshotMetadata{Index: new(uint64(4)), Term: new(uint64(4)), ConfState: cs}},
+				{Data: data, Metadata: &pb.SnapshotMetadata{Index: new(uint64(3)), Term: new(uint64(3)), ConfState: cs}},
+			},
+			expectedError: ErrSnapOutOfDate,
+		},
+		{
+			name: "bootstrap with confState",
+			snapshots: []*pb.Snapshot{
+				{Data: data, Metadata: &pb.SnapshotMetadata{ConfState: cs}},
+			},
+			expectedError: nil,
+		},
 	}
 
-	s := NewMemoryStorage()
-
-	i := 0
-	tt := tests[i]
-	require.NoError(t, s.ApplySnapshot(tt))
-
-	// ApplySnapshot fails due to ErrSnapOutOfDate.
-	i = 1
-	tt = tests[i]
-	require.Equal(t, ErrSnapOutOfDate, s.ApplySnapshot(tt))
+	for _, tt := range testCases {
+		t.Run(tt.name, func(t *testing.T) {
+			s := NewMemoryStorage()
+			var err error
+			for _, sn := range tt.snapshots {
+				err = s.ApplySnapshot(sn)
+			}
+			if tt.expectedError != nil {
+				require.Equal(t, tt.expectedError, err)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
 }

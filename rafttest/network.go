@@ -19,13 +19,15 @@ import (
 	"sync"
 	"time"
 
+	"google.golang.org/protobuf/proto"
+
 	"go.etcd.io/raft/v3/raftpb"
 )
 
 // a network interface
 type iface interface {
-	send(m raftpb.Message)
-	recv() chan raftpb.Message
+	send(m *raftpb.Message)
+	recv() chan *raftpb.Message
 	disconnect()
 	connect()
 }
@@ -36,7 +38,7 @@ type raftNetwork struct {
 	disconnected map[uint64]bool
 	dropmap      map[conn]float64
 	delaymap     map[conn]delay
-	recvQueues   map[uint64]chan raftpb.Message
+	recvQueues   map[uint64]chan *raftpb.Message
 }
 
 type conn struct {
@@ -51,14 +53,14 @@ type delay struct {
 func newRaftNetwork(nodes ...uint64) *raftNetwork {
 	pn := &raftNetwork{
 		rand:         rand.New(rand.NewSource(1)),
-		recvQueues:   make(map[uint64]chan raftpb.Message),
+		recvQueues:   make(map[uint64]chan *raftpb.Message),
 		dropmap:      make(map[conn]float64),
 		delaymap:     make(map[conn]delay),
 		disconnected: make(map[uint64]bool),
 	}
 
 	for _, n := range nodes {
-		pn.recvQueues[n] = make(chan raftpb.Message, 1024)
+		pn.recvQueues[n] = make(chan *raftpb.Message, 1024)
 	}
 	return pn
 }
@@ -67,14 +69,14 @@ func (rn *raftNetwork) nodeNetwork(id uint64) iface {
 	return &nodeNetwork{id: id, raftNetwork: rn}
 }
 
-func (rn *raftNetwork) send(m raftpb.Message) {
+func (rn *raftNetwork) send(m *raftpb.Message) {
 	rn.mu.Lock()
-	to := rn.recvQueues[m.To]
-	if rn.disconnected[m.To] {
+	to := rn.recvQueues[m.GetTo()]
+	if rn.disconnected[m.GetTo()] {
 		to = nil
 	}
-	drop := rn.dropmap[conn{m.From, m.To}]
-	dl := rn.delaymap[conn{m.From, m.To}]
+	drop := rn.dropmap[conn{m.GetFrom(), m.GetTo()}]
+	dl := rn.delaymap[conn{m.GetFrom(), m.GetTo()}]
 	rn.mu.Unlock()
 
 	if to == nil {
@@ -90,13 +92,13 @@ func (rn *raftNetwork) send(m raftpb.Message) {
 	}
 
 	// use marshal/unmarshal to copy message to avoid data race.
-	b, err := m.Marshal()
+	b, err := proto.Marshal(m)
 	if err != nil {
 		panic(err)
 	}
 
-	var cm raftpb.Message
-	err = cm.Unmarshal(b)
+	cm := &raftpb.Message{}
+	err = proto.Unmarshal(b, cm)
 	if err != nil {
 		panic(err)
 	}
@@ -108,7 +110,7 @@ func (rn *raftNetwork) send(m raftpb.Message) {
 	}
 }
 
-func (rn *raftNetwork) recvFrom(from uint64) chan raftpb.Message {
+func (rn *raftNetwork) recvFrom(from uint64) chan *raftpb.Message {
 	rn.mu.Lock()
 	fromc := rn.recvQueues[from]
 	if rn.disconnected[from] {
@@ -156,10 +158,10 @@ func (nt *nodeNetwork) disconnect() {
 	nt.raftNetwork.disconnect(nt.id)
 }
 
-func (nt *nodeNetwork) send(m raftpb.Message) {
+func (nt *nodeNetwork) send(m *raftpb.Message) {
 	nt.raftNetwork.send(m)
 }
 
-func (nt *nodeNetwork) recv() chan raftpb.Message {
+func (nt *nodeNetwork) recv() chan *raftpb.Message {
 	return nt.recvFrom(nt.id)
 }

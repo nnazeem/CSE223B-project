@@ -22,6 +22,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/proto"
 
 	"go.etcd.io/raft/v3/quorum"
 	pb "go.etcd.io/raft/v3/raftpb"
@@ -66,7 +67,7 @@ func (a *rawNodeAdapter) ReadIndex(_ context.Context, rctx []byte) error {
 	// RawNode swallowed the error in ReadIndex, it probably should not do that.
 	return nil
 }
-func (a *rawNodeAdapter) Step(_ context.Context, m pb.Message) error { return a.RawNode.Step(m) }
+func (a *rawNodeAdapter) Step(_ context.Context, m *pb.Message) error { return a.RawNode.Step(m) }
 func (a *rawNodeAdapter) Propose(_ context.Context, data []byte) error {
 	return a.RawNode.Propose(data)
 }
@@ -79,21 +80,21 @@ func TestRawNodeStep(t *testing.T) {
 	for i, msgn := range pb.MessageType_name {
 		t.Run(msgn, func(t *testing.T) {
 			s := NewMemoryStorage()
-			s.SetHardState(pb.HardState{Term: 1, Commit: 1})
-			s.Append([]pb.Entry{{Term: 1, Index: 1}})
-			require.NoError(t, s.ApplySnapshot(pb.Snapshot{Metadata: pb.SnapshotMetadata{
-				ConfState: pb.ConfState{
+			s.SetHardState(&pb.HardState{Term: new(uint64(1)), Commit: new(uint64(1))})
+			s.Append([]*pb.Entry{{Term: new(uint64(1)), Index: new(uint64(1))}})
+			require.NoError(t, s.ApplySnapshot(&pb.Snapshot{Metadata: &pb.SnapshotMetadata{
+				ConfState: &pb.ConfState{
 					Voters: []uint64{1},
 				},
-				Index: 1,
-				Term:  1,
+				Index: new(uint64(1)),
+				Term:  new(uint64(1)),
 			}}), "#%d", i)
 			// Append an empty entry to make sure the non-local messages (like
 			// vote requests) are ignored and don't trigger assertions.
 			rawNode, err := NewRawNode(newTestConfig(1, 10, 1, s))
 			require.NoError(t, err, "#%d", i)
 			msgt := pb.MessageType(i)
-			err = rawNode.Step(pb.Message{Type: msgt})
+			err = rawNode.Step(&pb.Message{Type: msgt.Enum()})
 			// LocalMsg should be ignored.
 			if IsLocalMsg(msgt) {
 				assert.Equal(t, ErrStepLocalMsg, err, "#%d", i)
@@ -112,85 +113,85 @@ func TestRawNodeStep(t *testing.T) {
 func TestRawNodeProposeAndConfChange(t *testing.T) {
 	testCases := []struct {
 		cc   pb.ConfChangeI
-		exp  pb.ConfState
+		exp  *pb.ConfState
 		exp2 *pb.ConfState
 	}{
 		// V1 config change.
 		{
-			pb.ConfChange{Type: pb.ConfChangeAddNode, NodeID: 2},
-			pb.ConfState{Voters: []uint64{1, 2}},
+			&pb.ConfChange{Type: pb.ConfChangeAddNode.Enum(), NodeId: new(uint64(2))},
+			&pb.ConfState{Voters: []uint64{1, 2}},
 			nil,
 		},
 		// Proposing the same as a V2 change works just the same, without entering
 		// a joint config.
 		{
-			pb.ConfChangeV2{Changes: []pb.ConfChangeSingle{
-				{Type: pb.ConfChangeAddNode, NodeID: 2},
+			&pb.ConfChangeV2{Changes: []*pb.ConfChangeSingle{
+				{Type: pb.ConfChangeAddNode.Enum(), NodeId: new(uint64(2))},
 			},
 			},
-			pb.ConfState{Voters: []uint64{1, 2}},
+			&pb.ConfState{Voters: []uint64{1, 2}},
 			nil,
 		},
 		// Ditto if we add it as a learner instead.
 		{
-			pb.ConfChangeV2{Changes: []pb.ConfChangeSingle{
-				{Type: pb.ConfChangeAddLearnerNode, NodeID: 2},
+			&pb.ConfChangeV2{Changes: []*pb.ConfChangeSingle{
+				{Type: pb.ConfChangeAddLearnerNode.Enum(), NodeId: new(uint64(2))},
 			},
 			},
-			pb.ConfState{Voters: []uint64{1}, Learners: []uint64{2}},
+			&pb.ConfState{Voters: []uint64{1}, Learners: []uint64{2}},
 			nil,
 		},
 		// We can ask explicitly for joint consensus if we want it.
 		{
-			pb.ConfChangeV2{Changes: []pb.ConfChangeSingle{
-				{Type: pb.ConfChangeAddLearnerNode, NodeID: 2},
+			&pb.ConfChangeV2{Changes: []*pb.ConfChangeSingle{
+				{Type: pb.ConfChangeAddLearnerNode.Enum(), NodeId: new(uint64(2))},
 			},
-				Transition: pb.ConfChangeTransitionJointExplicit,
+				Transition: pb.ConfChangeTransitionJointExplicit.Enum(),
 			},
-			pb.ConfState{Voters: []uint64{1}, VotersOutgoing: []uint64{1}, Learners: []uint64{2}},
+			&pb.ConfState{Voters: []uint64{1}, VotersOutgoing: []uint64{1}, Learners: []uint64{2}},
 			&pb.ConfState{Voters: []uint64{1}, Learners: []uint64{2}},
 		},
 		// Ditto, but with implicit transition (the harness checks this).
 		{
-			pb.ConfChangeV2{Changes: []pb.ConfChangeSingle{
-				{Type: pb.ConfChangeAddLearnerNode, NodeID: 2},
+			&pb.ConfChangeV2{Changes: []*pb.ConfChangeSingle{
+				{Type: pb.ConfChangeAddLearnerNode.Enum(), NodeId: new(uint64(2))},
 			},
-				Transition: pb.ConfChangeTransitionJointImplicit,
+				Transition: pb.ConfChangeTransitionJointImplicit.Enum(),
 			},
-			pb.ConfState{
+			&pb.ConfState{
 				Voters: []uint64{1}, VotersOutgoing: []uint64{1}, Learners: []uint64{2},
-				AutoLeave: true,
+				AutoLeave: new(true),
 			},
 			&pb.ConfState{Voters: []uint64{1}, Learners: []uint64{2}},
 		},
 		// Add a new node and demote n1. This exercises the interesting case in
 		// which we really need joint config changes and also need LearnersNext.
 		{
-			pb.ConfChangeV2{Changes: []pb.ConfChangeSingle{
-				{NodeID: 2, Type: pb.ConfChangeAddNode},
-				{NodeID: 1, Type: pb.ConfChangeAddLearnerNode},
-				{NodeID: 3, Type: pb.ConfChangeAddLearnerNode},
+			&pb.ConfChangeV2{Changes: []*pb.ConfChangeSingle{
+				{NodeId: new(uint64(2)), Type: pb.ConfChangeAddNode.Enum()},
+				{NodeId: new(uint64(1)), Type: pb.ConfChangeAddLearnerNode.Enum()},
+				{NodeId: new(uint64(3)), Type: pb.ConfChangeAddLearnerNode.Enum()},
 			},
 			},
-			pb.ConfState{
+			&pb.ConfState{
 				Voters:         []uint64{2},
 				VotersOutgoing: []uint64{1},
 				Learners:       []uint64{3},
 				LearnersNext:   []uint64{1},
-				AutoLeave:      true,
+				AutoLeave:      new(true),
 			},
 			&pb.ConfState{Voters: []uint64{2}, Learners: []uint64{1, 3}},
 		},
 		// Ditto explicit.
 		{
-			pb.ConfChangeV2{Changes: []pb.ConfChangeSingle{
-				{NodeID: 2, Type: pb.ConfChangeAddNode},
-				{NodeID: 1, Type: pb.ConfChangeAddLearnerNode},
-				{NodeID: 3, Type: pb.ConfChangeAddLearnerNode},
+			&pb.ConfChangeV2{Changes: []*pb.ConfChangeSingle{
+				{NodeId: new(uint64(2)), Type: pb.ConfChangeAddNode.Enum()},
+				{NodeId: new(uint64(1)), Type: pb.ConfChangeAddLearnerNode.Enum()},
+				{NodeId: new(uint64(3)), Type: pb.ConfChangeAddLearnerNode.Enum()},
 			},
-				Transition: pb.ConfChangeTransitionJointExplicit,
+				Transition: pb.ConfChangeTransitionJointExplicit.Enum(),
 			},
-			pb.ConfState{
+			&pb.ConfState{
 				Voters:         []uint64{2},
 				VotersOutgoing: []uint64{1},
 				Learners:       []uint64{3},
@@ -200,20 +201,20 @@ func TestRawNodeProposeAndConfChange(t *testing.T) {
 		},
 		// Ditto implicit.
 		{
-			pb.ConfChangeV2{
-				Changes: []pb.ConfChangeSingle{
-					{NodeID: 2, Type: pb.ConfChangeAddNode},
-					{NodeID: 1, Type: pb.ConfChangeAddLearnerNode},
-					{NodeID: 3, Type: pb.ConfChangeAddLearnerNode},
+			&pb.ConfChangeV2{
+				Changes: []*pb.ConfChangeSingle{
+					{NodeId: new(uint64(2)), Type: pb.ConfChangeAddNode.Enum()},
+					{NodeId: new(uint64(1)), Type: pb.ConfChangeAddLearnerNode.Enum()},
+					{NodeId: new(uint64(3)), Type: pb.ConfChangeAddLearnerNode.Enum()},
 				},
-				Transition: pb.ConfChangeTransitionJointImplicit,
+				Transition: pb.ConfChangeTransitionJointImplicit.Enum(),
 			},
-			pb.ConfState{
+			&pb.ConfState{
 				Voters:         []uint64{2},
 				VotersOutgoing: []uint64{1},
 				Learners:       []uint64{3},
 				LearnersNext:   []uint64{1},
-				AutoLeave:      true,
+				AutoLeave:      new(true),
 			},
 			&pb.ConfState{Voters: []uint64{2}, Learners: []uint64{1, 3}},
 		},
@@ -221,6 +222,8 @@ func TestRawNodeProposeAndConfChange(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run("", func(t *testing.T) {
+			pb.EnsureConfState(tc.exp)
+			pb.EnsureConfState(tc.exp2)
 			s := newTestMemoryStorage(withPeers(1))
 			rawNode, err := NewRawNode(newTestConfig(1, 10, 1, s))
 			require.NoError(t, err)
@@ -239,13 +242,13 @@ func TestRawNodeProposeAndConfChange(t *testing.T) {
 				s.Append(rd.Entries)
 				for _, ent := range rd.CommittedEntries {
 					var cc pb.ConfChangeI
-					if ent.Type == pb.EntryConfChange {
-						var ccc pb.ConfChange
-						require.NoError(t, ccc.Unmarshal(ent.Data))
+					if ent.GetType() == pb.EntryConfChange {
+						ccc := &pb.ConfChange{}
+						require.NoError(t, proto.Unmarshal(ent.GetData(), ccc))
 						cc = ccc
-					} else if ent.Type == pb.EntryConfChangeV2 {
-						var ccc pb.ConfChangeV2
-						require.NoError(t, ccc.Unmarshal(ent.Data))
+					} else if ent.GetType() == pb.EntryConfChangeV2 {
+						ccc := &pb.ConfChangeV2{}
+						require.NoError(t, proto.Unmarshal(ent.GetData(), ccc))
 						cc = ccc
 					}
 					if cc != nil {
@@ -257,12 +260,12 @@ func TestRawNodeProposeAndConfChange(t *testing.T) {
 				if !proposed && rd.SoftState.Lead == rawNode.raft.id {
 					require.NoError(t, rawNode.Propose([]byte("somedata")))
 					if ccv1, ok := tc.cc.AsV1(); ok {
-						ccdata, err = ccv1.Marshal()
+						ccdata, err = proto.Marshal(ccv1)
 						require.NoError(t, err)
 						rawNode.ProposeConfChange(ccv1)
 					} else {
 						ccv2 := tc.cc.AsV2()
-						ccdata, err = ccv2.Marshal()
+						ccdata, err = proto.Marshal(ccv2)
 						require.NoError(t, err)
 						rawNode.ProposeConfChange(ccv2)
 					}
@@ -280,16 +283,16 @@ func TestRawNodeProposeAndConfChange(t *testing.T) {
 			entries, err := s.Entries(lastIndex-1, lastIndex+1, noLimit)
 			require.NoError(t, err)
 			require.Len(t, entries, 2)
-			assert.Equal(t, []byte("somedata"), entries[0].Data)
+			assert.Equal(t, []byte("somedata"), entries[0].GetData())
 
 			typ := pb.EntryConfChange
 			if _, ok := tc.cc.AsV1(); !ok {
 				typ = pb.EntryConfChangeV2
 			}
-			require.Equal(t, typ, entries[1].Type)
-			assert.Equal(t, ccdata, entries[1].Data)
+			require.Equal(t, typ, entries[1].GetType())
+			assert.Equal(t, ccdata, entries[1].GetData())
 
-			require.Equal(t, &tc.exp, cs)
+			require.Equal(t, tc.exp, cs)
 
 			var maybePlusOne uint64
 			if autoLeave, ok := tc.cc.AsV2().EnterJoint(); ok && autoLeave {
@@ -309,7 +312,7 @@ func TestRawNodeProposeAndConfChange(t *testing.T) {
 			// it manually.
 			rd := rawNode.Ready()
 			var context []byte
-			if !tc.exp.AutoLeave {
+			if !tc.exp.GetAutoLeave() {
 				require.Empty(t, rd.Entries)
 				rawNode.Advance(rd)
 				if tc.exp2 == nil {
@@ -317,16 +320,16 @@ func TestRawNodeProposeAndConfChange(t *testing.T) {
 				}
 				context = []byte("manual")
 				t.Log("leaving joint state manually")
-				require.NoError(t, rawNode.ProposeConfChange(pb.ConfChangeV2{Context: context}))
+				require.NoError(t, rawNode.ProposeConfChange(&pb.ConfChangeV2{Context: context}))
 				rd = rawNode.Ready()
 			}
 
 			// Check that the right ConfChange comes out.
 			require.Len(t, rd.Entries, 1)
-			require.Equal(t, pb.EntryConfChangeV2, rd.Entries[0].Type)
-			var cc pb.ConfChangeV2
-			require.NoError(t, cc.Unmarshal(rd.Entries[0].Data))
-			require.Equal(t, pb.ConfChangeV2{Context: context}, cc)
+			require.Equal(t, pb.EntryConfChangeV2, rd.Entries[0].GetType())
+			cc := &pb.ConfChangeV2{}
+			require.NoError(t, proto.Unmarshal(rd.Entries[0].GetData(), cc))
+			require.True(t, proto.Equal(&pb.ConfChangeV2{Context: context}, cc))
 
 			// Lie and pretend the ConfChange applied. It won't do so because now
 			// we require the joint quorum and we're only running one node.
@@ -341,16 +344,16 @@ func TestRawNodeProposeAndConfChange(t *testing.T) {
 // TestRawNodeJointAutoLeave tests the configuration change auto leave even leader
 // lost leadership.
 func TestRawNodeJointAutoLeave(t *testing.T) {
-	testCc := pb.ConfChangeV2{Changes: []pb.ConfChangeSingle{
-		{Type: pb.ConfChangeAddLearnerNode, NodeID: 2},
+	testCc := &pb.ConfChangeV2{Changes: []*pb.ConfChangeSingle{
+		{Type: pb.ConfChangeAddLearnerNode.Enum(), NodeId: new(uint64(2))},
 	},
-		Transition: pb.ConfChangeTransitionJointImplicit,
+		Transition: pb.ConfChangeTransitionJointImplicit.Enum(),
 	}
-	expCs := pb.ConfState{
+	expCs := &pb.ConfState{
 		Voters: []uint64{1}, VotersOutgoing: []uint64{1}, Learners: []uint64{2},
-		AutoLeave: true,
+		AutoLeave: new(true),
 	}
-	exp2Cs := pb.ConfState{Voters: []uint64{1}, Learners: []uint64{2}}
+	exp2Cs := &pb.ConfState{Voters: []uint64{1}, Learners: []uint64{2}, AutoLeave: new(false)}
 
 	s := newTestMemoryStorage(withPeers(1))
 	rawNode, err := NewRawNode(newTestConfig(1, 10, 1, s))
@@ -370,14 +373,14 @@ func TestRawNodeJointAutoLeave(t *testing.T) {
 		s.Append(rd.Entries)
 		for _, ent := range rd.CommittedEntries {
 			var cc pb.ConfChangeI
-			if ent.Type == pb.EntryConfChangeV2 {
-				var ccc pb.ConfChangeV2
-				require.NoError(t, ccc.Unmarshal(ent.Data))
-				cc = &ccc
+			if ent.GetType() == pb.EntryConfChangeV2 {
+				ccc := &pb.ConfChangeV2{}
+				require.NoError(t, proto.Unmarshal(ent.GetData(), ccc))
+				cc = ccc
 			}
 			if cc != nil {
 				// Force it step down.
-				rawNode.Step(pb.Message{Type: pb.MsgHeartbeatResp, From: 1, Term: rawNode.raft.Term + 1})
+				rawNode.Step(&pb.Message{Type: pb.MsgHeartbeatResp.Enum(), From: new(uint64(1)), Term: new(rawNode.raft.Term + 1)})
 				cs = rawNode.ApplyConfChange(cc)
 			}
 		}
@@ -385,7 +388,7 @@ func TestRawNodeJointAutoLeave(t *testing.T) {
 		// Once we are the leader, propose a command and a ConfChange.
 		if !proposed && rd.SoftState.Lead == rawNode.raft.id {
 			require.NoError(t, rawNode.Propose([]byte("somedata")))
-			ccdata, err = testCc.Marshal()
+			ccdata, err = proto.Marshal(testCc)
 			require.NoError(t, err)
 			rawNode.ProposeConfChange(testCc)
 			proposed = true
@@ -402,11 +405,11 @@ func TestRawNodeJointAutoLeave(t *testing.T) {
 	entries, err := s.Entries(lastIndex-1, lastIndex+1, noLimit)
 	require.NoError(t, err)
 	require.Len(t, entries, 2)
-	assert.Equal(t, []byte("somedata"), entries[0].Data)
-	require.Equal(t, pb.EntryConfChangeV2, entries[1].Type)
-	assert.Equal(t, ccdata, entries[1].Data)
+	assert.Equal(t, []byte("somedata"), entries[0].GetData())
+	require.Equal(t, pb.EntryConfChangeV2, entries[1].GetType())
+	assert.Equal(t, ccdata, entries[1].GetData())
 
-	require.Equal(t, &expCs, cs)
+	require.Equal(t, expCs, cs)
 
 	require.Zero(t, rawNode.raft.pendingConfIndex)
 
@@ -434,14 +437,14 @@ func TestRawNodeJointAutoLeave(t *testing.T) {
 	s.Append(rd.Entries)
 	// Check that the right ConfChange comes out.
 	require.Len(t, rd.Entries, 1)
-	require.Equal(t, pb.EntryConfChangeV2, rd.Entries[0].Type)
-	var cc pb.ConfChangeV2
-	require.NoError(t, cc.Unmarshal(rd.Entries[0].Data))
-	require.Equal(t, pb.ConfChangeV2{Context: nil}, cc)
+	require.Equal(t, pb.EntryConfChangeV2, rd.Entries[0].GetType())
+	cc := &pb.ConfChangeV2{}
+	require.NoError(t, proto.Unmarshal(rd.Entries[0].GetData(), cc))
+	require.True(t, proto.Equal(&pb.ConfChangeV2{}, cc))
 	// Lie and pretend the ConfChange applied. It won't do so because now
 	// we require the joint quorum and we're only running one node.
 	cs = rawNode.ApplyConfChange(cc)
-	require.Equal(t, exp2Cs, *cs)
+	require.Equal(t, exp2Cs, cs)
 }
 
 // TestRawNodeProposeAddDuplicateNode ensures that two proposes to add the same node should
@@ -466,22 +469,22 @@ func TestRawNodeProposeAddDuplicateNode(t *testing.T) {
 		rawNode.Advance(rd)
 	}
 
-	proposeConfChangeAndApply := func(cc pb.ConfChange) {
+	proposeConfChangeAndApply := func(cc *pb.ConfChange) {
 		rawNode.ProposeConfChange(cc)
 		rd = rawNode.Ready()
 		s.Append(rd.Entries)
 		for _, entry := range rd.CommittedEntries {
-			if entry.Type == pb.EntryConfChange {
-				var cc pb.ConfChange
-				cc.Unmarshal(entry.Data)
+			if entry.GetType() == pb.EntryConfChange {
+				cc := &pb.ConfChange{}
+				proto.Unmarshal(entry.GetData(), cc)
 				rawNode.ApplyConfChange(cc)
 			}
 		}
 		rawNode.Advance(rd)
 	}
 
-	cc1 := pb.ConfChange{Type: pb.ConfChangeAddNode, NodeID: 1}
-	ccdata1, err := cc1.Marshal()
+	cc1 := &pb.ConfChange{Type: pb.ConfChangeAddNode.Enum(), NodeId: new(uint64(1))}
+	ccdata1, err := proto.Marshal(cc1)
 	require.NoError(t, err)
 	proposeConfChangeAndApply(cc1)
 
@@ -489,8 +492,8 @@ func TestRawNodeProposeAddDuplicateNode(t *testing.T) {
 	proposeConfChangeAndApply(cc1)
 
 	// the new node join should be ok
-	cc2 := pb.ConfChange{Type: pb.ConfChangeAddNode, NodeID: 2}
-	ccdata2, err := cc2.Marshal()
+	cc2 := &pb.ConfChange{Type: pb.ConfChangeAddNode.Enum(), NodeId: new(uint64(2))}
+	ccdata2, err := proto.Marshal(cc2)
 	require.NoError(t, err)
 	proposeConfChangeAndApply(cc2)
 
@@ -501,15 +504,15 @@ func TestRawNodeProposeAddDuplicateNode(t *testing.T) {
 	entries, err := s.Entries(lastIndex-2, lastIndex+1, noLimit)
 	require.NoError(t, err)
 	require.Len(t, entries, 3)
-	assert.Equal(t, ccdata1, entries[0].Data)
-	assert.Equal(t, ccdata2, entries[2].Data)
+	assert.Equal(t, ccdata1, entries[0].GetData())
+	assert.Equal(t, ccdata2, entries[2].GetData())
 }
 
 // TestRawNodeReadIndex ensures that Rawnode.ReadIndex sends the MsgReadIndex message
 // to the underlying raft. It also ensures that ReadState can be read out.
 func TestRawNodeReadIndex(t *testing.T) {
-	var msgs []pb.Message
-	appendStep := func(_ *raft, m pb.Message) error {
+	var msgs []*pb.Message
+	appendStep := func(_ *raft, m *pb.Message) error {
 		msgs = append(msgs, m)
 		return nil
 	}
@@ -548,8 +551,8 @@ func TestRawNodeReadIndex(t *testing.T) {
 	}
 	// ensure that MsgReadIndex message is sent to the underlying raft
 	require.Len(t, msgs, 1)
-	assert.Equal(t, pb.MsgReadIndex, msgs[0].Type)
-	assert.Equal(t, wrequestCtx, msgs[0].Entries[0].Data)
+	assert.Equal(t, pb.MsgReadIndex, msgs[0].GetType())
+	assert.Equal(t, wrequestCtx, msgs[0].GetEntries()[0].GetData())
 }
 
 // TestBlockProposal from node_test.go has no equivalent in rawNode because there is
@@ -565,20 +568,20 @@ func TestRawNodeReadIndex(t *testing.T) {
 // requires the application to bootstrap the state, i.e. it does not accept peers
 // and will not create faux configuration change entries.
 func TestRawNodeStart(t *testing.T) {
-	entries := []pb.Entry{
-		{Term: 1, Index: 2, Data: nil},           // empty entry
-		{Term: 1, Index: 3, Data: []byte("foo")}, // non-empty entry
+	entries := []*pb.Entry{
+		{Term: new(uint64(1)), Index: new(uint64(2)), Data: nil},           // empty entry
+		{Term: new(uint64(1)), Index: new(uint64(3)), Data: []byte("foo")}, // non-empty entry
 	}
 	want := Ready{
 		SoftState:        &SoftState{Lead: 1, RaftState: StateLeader},
-		HardState:        pb.HardState{Term: 1, Commit: 3, Vote: 1},
+		HardState:        &pb.HardState{Term: new(uint64(1)), Commit: new(uint64(3)), Vote: new(uint64(1))},
 		Entries:          nil, // emitted & checked in intermediate Ready cycle
 		CommittedEntries: entries,
 		MustSync:         false, // since we're only applying, not appending
 	}
 
 	storage := NewMemoryStorage()
-	storage.ents[0].Index = 1
+	storage.ents[0].Index = new(uint64(1))
 
 	// TODO(tbg): this is a first prototype of what bootstrapping could look
 	// like (without the annoying faux ConfChanges). We want to persist a
@@ -593,9 +596,9 @@ func TestRawNodeStart(t *testing.T) {
 	// index 10, so empty followers (at index 1) always need a snapshot first.
 	type appenderStorage interface {
 		Storage
-		ApplySnapshot(pb.Snapshot) error
+		ApplySnapshot(*pb.Snapshot) error
 	}
-	bootstrap := func(storage appenderStorage, cs pb.ConfState) error {
+	bootstrap := func(storage appenderStorage, cs *pb.ConfState) error {
 		require.NotEmpty(t, cs.Voters, "no voters specified")
 		fi, err := storage.FirstIndex()
 		require.NoError(t, err)
@@ -616,16 +619,15 @@ func TestRawNodeStart(t *testing.T) {
 		require.True(t, IsEmptyHardState(hs))
 		require.Empty(t, ics.Voters)
 
-		meta := pb.SnapshotMetadata{
-			Index:     1,
-			Term:      0,
+		snap := &pb.Snapshot{Metadata: &pb.SnapshotMetadata{
+			Index:     new(uint64(1)),
+			Term:      new(uint64(0)),
 			ConfState: cs,
-		}
-		snap := pb.Snapshot{Metadata: meta}
+		}}
 		return storage.ApplySnapshot(snap)
 	}
 
-	require.NoError(t, bootstrap(storage, pb.ConfState{Voters: []uint64{1}}))
+	require.NoError(t, bootstrap(storage, &pb.ConfState{Voters: []uint64{1}}))
 
 	rawNode, err := NewRawNode(newTestConfig(1, 10, 1, storage))
 	require.NoError(t, err)
@@ -639,7 +641,7 @@ func TestRawNodeStart(t *testing.T) {
 	require.True(t, rawNode.HasReady())
 
 	rd = rawNode.Ready()
-	require.Equal(t, entries, rd.Entries)
+	requireEqualEntries(t, entries, rd.Entries)
 	storage.Append(rd.Entries)
 	rawNode.Advance(rd)
 
@@ -651,21 +653,21 @@ func TestRawNodeStart(t *testing.T) {
 
 	rd.SoftState, want.SoftState = nil, nil
 
-	require.Equal(t, want, rd)
+	requireEqualReady(t, want, rd)
 	assert.False(t, rawNode.HasReady())
 }
 
 func TestRawNodeRestart(t *testing.T) {
-	entries := []pb.Entry{
-		{Term: 1, Index: 1},
-		{Term: 1, Index: 2, Data: []byte("foo")},
+	entries := []*pb.Entry{
+		{Term: new(uint64(1)), Index: new(uint64(1))},
+		{Term: new(uint64(1)), Index: new(uint64(2)), Data: []byte("foo")},
 	}
-	st := pb.HardState{Term: 1, Commit: 1}
+	st := &pb.HardState{Term: new(uint64(1)), Commit: new(uint64(1))}
 
 	want := Ready{
-		HardState: emptyState,
+		HardState: nil,
 		// commit up to commit index in st
-		CommittedEntries: entries[:st.Commit],
+		CommittedEntries: entries[:st.GetCommit()],
 		MustSync:         false,
 	}
 
@@ -681,20 +683,20 @@ func TestRawNodeRestart(t *testing.T) {
 }
 
 func TestRawNodeRestartFromSnapshot(t *testing.T) {
-	snap := pb.Snapshot{
-		Metadata: pb.SnapshotMetadata{
-			ConfState: pb.ConfState{Voters: []uint64{1, 2}},
-			Index:     2,
-			Term:      1,
+	snap := &pb.Snapshot{
+		Metadata: &pb.SnapshotMetadata{
+			ConfState: &pb.ConfState{Voters: []uint64{1, 2}},
+			Index:     new(uint64(2)),
+			Term:      new(uint64(1)),
 		},
 	}
-	entries := []pb.Entry{
-		{Term: 1, Index: 3, Data: []byte("foo")},
+	entries := []*pb.Entry{
+		{Term: new(uint64(1)), Index: new(uint64(3)), Data: []byte("foo")},
 	}
-	st := pb.HardState{Term: 1, Commit: 3}
+	st := &pb.HardState{Term: new(uint64(1)), Commit: new(uint64(3))}
 
 	want := Ready{
-		HardState: emptyState,
+		HardState: nil,
 		// commit up to commit index in st
 		CommittedEntries: entries,
 		MustSync:         false,
@@ -756,39 +758,29 @@ func TestRawNodeCommitPaginationAfterRestart(t *testing.T) {
 	s := &ignoreSizeHintMemStorage{
 		MemoryStorage: newTestMemoryStorage(withPeers(1)),
 	}
-	persistedHardState := pb.HardState{
-		Term:   1,
-		Vote:   1,
-		Commit: 10,
+	persistedHardState := &pb.HardState{
+		Term:   new(uint64(1)),
+		Vote:   new(uint64(1)),
+		Commit: new(uint64(10)),
 	}
 
 	s.hardState = persistedHardState
-	s.ents = make([]pb.Entry, 10)
+	s.ents = make([]*pb.Entry, 10)
 	var size uint64
 	for i := range s.ents {
-		ent := pb.Entry{
-			Term:  1,
-			Index: uint64(i + 1),
-			Type:  pb.EntryNormal,
-			Data:  []byte("a"),
-		}
+		ent := &pb.Entry{Term: new(uint64(1)), Index: new(uint64(i + 1)), Type: pb.EntryNormal.Enum(), Data: []byte("a")}
 
 		s.ents[i] = ent
-		size += uint64(ent.Size())
+		size += uint64(proto.Size(ent))
 	}
 
 	cfg := newTestConfig(1, 10, 1, s)
 	// Set a MaxSizePerMsg that would suggest to Raft that the last committed entry should
 	// not be included in the initial rd.CommittedEntries. However, our storage will ignore
 	// this and *will* return it (which is how the Commit index ended up being 10 initially).
-	cfg.MaxSizePerMsg = size - uint64(s.ents[len(s.ents)-1].Size()) - 1
+	cfg.MaxSizePerMsg = size - uint64(proto.Size(s.ents[len(s.ents)-1])) - 1
 
-	s.ents = append(s.ents, pb.Entry{
-		Term:  1,
-		Index: uint64(11),
-		Type:  pb.EntryNormal,
-		Data:  []byte("boom"),
-	})
+	s.ents = append(s.ents, &pb.Entry{Term: new(uint64(1)), Index: new(uint64(11)), Type: pb.EntryNormal.Enum(), Data: []byte("boom")})
 
 	rawNode, err := NewRawNode(cfg)
 	require.NoError(t, err)
@@ -797,18 +789,18 @@ func TestRawNodeCommitPaginationAfterRestart(t *testing.T) {
 		rd := rawNode.Ready()
 		n := len(rd.CommittedEntries)
 		require.NotZero(t, n, "stopped applying entries at index %d", highestApplied)
-		next := rd.CommittedEntries[0].Index
+		next := rd.CommittedEntries[0].GetIndex()
 		require.False(t, highestApplied != 0 && highestApplied+1 != next,
 			"attempting to apply index %d after index %d, leaving a gap", next, highestApplied)
 
-		highestApplied = rd.CommittedEntries[n-1].Index
+		highestApplied = rd.CommittedEntries[n-1].GetIndex()
 		rawNode.Advance(rd)
-		rawNode.Step(pb.Message{
-			Type:   pb.MsgHeartbeat,
-			To:     1,
-			From:   2, // illegal, but we get away with it
-			Term:   1,
-			Commit: 11,
+		rawNode.Step(&pb.Message{
+			Type:   pb.MsgHeartbeat.Enum(),
+			To:     new(uint64(1)),
+			From:   new(uint64(2)), // illegal, but we get away with it
+			Term:   new(uint64(1)),
+			Commit: new(uint64(11)),
 		})
 	}
 }
@@ -820,7 +812,7 @@ func TestRawNodeCommitPaginationAfterRestart(t *testing.T) {
 func TestRawNodeBoundedLogGrowthWithPartition(t *testing.T) {
 	const maxEntries = 16
 	data := []byte("testdata")
-	testEntry := pb.Entry{Data: data}
+	testEntry := &pb.Entry{Data: data}
 	maxEntrySize := maxEntries * payloadSize(testEntry)
 	t.Log("maxEntrySize", maxEntrySize)
 
@@ -947,8 +939,8 @@ func TestRawNodeConsumeReady(t *testing.T) {
 	// the messages) but Ready() does.
 	s := newTestMemoryStorage(withPeers(1))
 	rn := newTestRawNode(1, 3, 1, s)
-	m1 := pb.Message{Context: []byte("foo")}
-	m2 := pb.Message{Context: []byte("bar")}
+	m1 := &pb.Message{Context: []byte("foo")}
+	m2 := &pb.Message{Context: []byte("bar")}
 
 	// Inject first message, make sure it's visible via readyWithoutAccept.
 	rn.raft.msgs = append(rn.raft.msgs, m1)
@@ -1021,23 +1013,23 @@ func benchmarkRawNodeImpl(b *testing.B, peers ...uint64) {
 				b.Log(DescribeReady(rd, nil))
 			}
 			if n := len(rd.CommittedEntries); n > 0 {
-				applied = rd.CommittedEntries[n-1].Index
+				applied = rd.CommittedEntries[n-1].GetIndex()
 			}
 			s.Append(rd.Entries)
 			for _, m := range rd.Messages {
-				if m.Type == pb.MsgVote {
-					resp := pb.Message{To: m.From, From: m.To, Term: m.Term, Type: pb.MsgVoteResp}
+				if m.GetType() == pb.MsgVote {
+					resp := &pb.Message{To: m.From, From: m.To, Term: m.Term, Type: pb.MsgVoteResp.Enum()}
 					if debug {
 						b.Log(DescribeMessage(resp, nil))
 					}
 					rn.Step(resp)
 				}
-				if m.Type == pb.MsgApp {
-					idx := m.Index
-					if n := len(m.Entries); n > 0 {
-						idx = m.Entries[n-1].Index
+				if m.GetType() == pb.MsgApp {
+					idx := m.GetIndex()
+					if n := len(m.GetEntries()); n > 0 {
+						idx = m.GetEntries()[n-1].GetIndex()
 					}
-					resp := pb.Message{To: m.From, From: m.To, Type: pb.MsgAppResp, Term: m.Term, Index: idx}
+					resp := &pb.Message{To: m.From, From: m.To, Type: pb.MsgAppResp.Enum(), Term: m.Term, Index: new(idx)}
 					if debug {
 						b.Log(DescribeMessage(resp, nil))
 					}

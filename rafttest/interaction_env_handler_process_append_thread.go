@@ -20,6 +20,7 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/datadriven"
+	"google.golang.org/protobuf/proto"
 
 	"go.etcd.io/raft/v3"
 	"go.etcd.io/raft/v3/raftpb"
@@ -53,20 +54,22 @@ func (env *InteractionEnv) ProcessAppendThread(idx int) error {
 	m := n.AppendWork[0]
 	n.AppendWork = n.AppendWork[1:]
 
-	resps := m.Responses
+	resps := m.GetResponses()
 	m.Responses = nil
 	env.Output.WriteString("Processing:\n")
 	env.Output.WriteString(raft.DescribeMessage(m, defaultEntryFormatter) + "\n")
-	st := raftpb.HardState{
-		Term:   m.Term,
-		Vote:   m.Vote,
-		Commit: m.Commit,
+	st := &raftpb.HardState{
+		Term:   new(m.GetTerm()),
+		Vote:   new(m.GetVote()),
+		Commit: new(m.GetCommit()),
 	}
-	var snap raftpb.Snapshot
-	if m.Snapshot != nil {
-		snap = *m.Snapshot
+	snap := m.GetSnapshot()
+	var cloned *raftpb.Snapshot
+	if snap != nil {
+		cloned = proto.Clone(snap).(*raftpb.Snapshot)
 	}
-	if err := processAppend(n, st, m.Entries, snap); err != nil {
+	cloned = raftpb.EnsureSnapshot(cloned)
+	if err := processAppend(n, st, m.GetEntries(), cloned); err != nil {
 		return err
 	}
 
@@ -78,7 +81,7 @@ func (env *InteractionEnv) ProcessAppendThread(idx int) error {
 	return nil
 }
 
-func processAppend(n *Node, st raftpb.HardState, ents []raftpb.Entry, snap raftpb.Snapshot) error {
+func processAppend(n *Node, st *raftpb.HardState, ents []*raftpb.Entry, snap *raftpb.Snapshot) error {
 	// TODO(tbg): the order of operations here is not necessarily safe. See:
 	// https://github.com/etcd-io/etcd/pull/10861
 	s := n.Storage

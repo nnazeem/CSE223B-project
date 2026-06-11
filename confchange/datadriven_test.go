@@ -49,7 +49,7 @@ func TestConfChangeDataDriven(t *testing.T) {
 			defer func() {
 				c.LastIndex++
 			}()
-			var ccs []pb.ConfChangeSingle
+			var ccs []*pb.ConfChangeSingle
 			toks := strings.Split(strings.TrimSpace(d.Input), " ")
 			if toks[0] == "" {
 				toks = nil
@@ -58,16 +58,16 @@ func TestConfChangeDataDriven(t *testing.T) {
 				if len(tok) < 2 {
 					return fmt.Sprintf("unknown token %s", tok)
 				}
-				var cc pb.ConfChangeSingle
+				cc := &pb.ConfChangeSingle{}
 				switch tok[0] {
 				case 'v':
-					cc.Type = pb.ConfChangeAddNode
+					cc.Type = pb.ConfChangeAddNode.Enum()
 				case 'l':
-					cc.Type = pb.ConfChangeAddLearnerNode
+					cc.Type = pb.ConfChangeAddLearnerNode.Enum()
 				case 'r':
-					cc.Type = pb.ConfChangeRemoveNode
+					cc.Type = pb.ConfChangeRemoveNode.Enum()
 				case 'u':
-					cc.Type = pb.ConfChangeUpdateNode
+					cc.Type = pb.ConfChangeUpdateNode.Enum()
 				default:
 					return fmt.Sprintf("unknown input: %s", tok)
 				}
@@ -75,7 +75,7 @@ func TestConfChangeDataDriven(t *testing.T) {
 				if err != nil {
 					return err.Error()
 				}
-				cc.NodeID = id
+				cc.NodeId = new(id)
 				ccs = append(ccs, cc)
 			}
 

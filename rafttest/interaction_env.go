@@ -39,9 +39,9 @@ type Node struct {
 	Storage
 
 	Config     *raft.Config
-	AppendWork []pb.Message // []MsgStorageAppend
-	ApplyWork  []pb.Message // []MsgStorageApply
-	History    []pb.Snapshot
+	AppendWork []*pb.Message // []MsgStorageAppend
+	ApplyWork  []*pb.Message // []MsgStorageApply
+	History    []*pb.Snapshot
 }
 
 // InteractionEnv facilitates testing of complex interactions between the
@@ -49,7 +49,7 @@ type Node struct {
 type InteractionEnv struct {
 	Options  *InteractionOpts
 	Nodes    []Node
-	Messages []pb.Message // in-flight messages
+	Messages []*pb.Message // in-flight messages
 
 	Output *RedirectLogger
 }
@@ -84,10 +84,10 @@ func (env *InteractionEnv) withIndent(f func()) {
 // the Ready handling loop.
 type Storage interface {
 	raft.Storage
-	SetHardState(state pb.HardState) error
-	ApplySnapshot(pb.Snapshot) error
+	SetHardState(state *pb.HardState) error
+	ApplySnapshot(*pb.Snapshot) error
 	Compact(newFirstIndex uint64) error
-	Append([]pb.Entry) error
+	Append([]*pb.Entry) error
 }
 
 // raftConfigStub sets up a raft.Config stub with reasonable testing defaults.

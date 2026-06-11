@@ -81,7 +81,7 @@ type Recipient struct {
 func (env *InteractionEnv) DeliverMsgs(typ raftpb.MessageType, rs ...Recipient) int {
 	var n int
 	for _, r := range rs {
-		var msgs []raftpb.Message
+		var msgs []*raftpb.Message
 		msgs, env.Messages = splitMsgs(env.Messages, r.ID, typ, r.Drop)
 		n += len(msgs)
 		for _, msg := range msgs {
@@ -94,7 +94,7 @@ func (env *InteractionEnv) DeliverMsgs(typ raftpb.MessageType, rs ...Recipient) 
 				// we haven't used msg.To yet.
 				continue
 			}
-			toIdx := int(msg.To - 1)
+			toIdx := int(msg.GetTo() - 1)
 			if err := env.Nodes[toIdx].Step(msg); err != nil {
 				fmt.Fprintln(env.Output, err)
 			}

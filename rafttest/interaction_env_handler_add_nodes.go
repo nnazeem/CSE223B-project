@@ -17,10 +17,10 @@ package rafttest
 import (
 	"errors"
 	"fmt"
-	"reflect"
 	"testing"
 
 	"github.com/cockroachdb/datadriven"
+	"google.golang.org/protobuf/proto"
 
 	"go.etcd.io/raft/v3"
 	pb "go.etcd.io/raft/v3/raftpb"
@@ -28,7 +28,7 @@ import (
 
 func (env *InteractionEnv) handleAddNodes(t *testing.T, d datadriven.TestData) error {
 	n := firstAsInt(t, d)
-	var snap pb.Snapshot
+	snap := pb.EnsureSnapshot(nil)
 	cfg := raftConfigStub()
 	for _, arg := range d.CmdArgs[1:] {
 		for i := range arg.Vals {
@@ -44,8 +44,10 @@ func (env *InteractionEnv) handleAddNodes(t *testing.T, d datadriven.TestData) e
 			case "inflight":
 				arg.Scan(t, i, &cfg.MaxInflightMsgs)
 			case "index":
-				arg.Scan(t, i, &snap.Metadata.Index)
-				cfg.Applied = snap.Metadata.Index
+				var idx uint64
+				arg.Scan(t, i, &idx)
+				snap.Metadata.Index = new(idx)
+				cfg.Applied = snap.GetMetadata().GetIndex()
 			case "content":
 				arg.Scan(t, i, &snap.Data)
 			case "async-storage-writes":
@@ -77,10 +79,10 @@ func (env *InteractionEnv) handleAddNodes(t *testing.T, d datadriven.TestData) e
 
 type snapOverrideStorage struct {
 	Storage
-	snapshotOverride func() (pb.Snapshot, error)
+	snapshotOverride func() (*pb.Snapshot, error)
 }
 
-func (s snapOverrideStorage) Snapshot() (pb.Snapshot, error) {
+func (s snapOverrideStorage) Snapshot() (*pb.Snapshot, error) {
 	if s.snapshotOverride != nil {
 		return s.snapshotOverride()
 	}
@@ -91,8 +93,10 @@ var _ raft.Storage = snapOverrideStorage{}
 
 // AddNodes adds n new nodes initialized from the given snapshot (which may be
 // empty), and using the cfg as template. They will be assigned consecutive IDs.
-func (env *InteractionEnv) AddNodes(n int, cfg raft.Config, snap pb.Snapshot) error {
-	bootstrap := !reflect.DeepEqual(snap, pb.Snapshot{})
+func (env *InteractionEnv) AddNodes(n int, cfg raft.Config, snap *pb.Snapshot) error {
+	emptySnapshot := pb.EnsureSnapshot(nil)
+	snap = pb.EnsureSnapshot(snap)
+	bootstrap := !proto.Equal(snap, emptySnapshot)
 	for i := 0; i < n; i++ {
 		id := uint64(1 + len(env.Nodes))
 		s := snapOverrideStorage{
@@ -103,7 +107,7 @@ func (env *InteractionEnv) AddNodes(n int, cfg raft.Config, snap pb.Snapshot) er
 			// give you some fixed snapshot and also the snapshot changes
 			// whenever you compact the logs and vice versa, so it's all a bit
 			// awkward to use.
-			snapshotOverride: func() (pb.Snapshot, error) {
+			snapshotOverride: func() (*pb.Snapshot, error) {
 				snaps := env.Nodes[int(id-1)].History
 				return snaps[len(snaps)-1], nil
 			},
@@ -111,10 +115,10 @@ func (env *InteractionEnv) AddNodes(n int, cfg raft.Config, snap pb.Snapshot) er
 		if bootstrap {
 			// NB: we could make this work with 1, but MemoryStorage just
 			// doesn't play well with that and it's not a loss of generality.
-			if snap.Metadata.Index <= 1 {
+			if snap.GetMetadata().GetIndex() <= 1 {
 				return errors.New("index must be specified as > 1 due to bootstrap")
 			}
-			snap.Metadata.Term = 1
+			snap.Metadata.Term = new(uint64(1))
 			if err := s.ApplySnapshot(snap); err != nil {
 				return err
 			}
@@ -125,7 +129,7 @@ func (env *InteractionEnv) AddNodes(n int, cfg raft.Config, snap pb.Snapshot) er
 			// At the time of writing and for *MemoryStorage, applying a
 			// snapshot also truncates appropriately, but this would change with
 			// other storage engines potentially.
-			if exp := snap.Metadata.Index + 1; fi != exp {
+			if exp := snap.GetMetadata().GetIndex() + 1; fi != exp {
 				return fmt.Errorf("failed to establish first index %d; got %d", exp, fi)
 			}
 		}
@@ -155,7 +159,7 @@ func (env *InteractionEnv) AddNodes(n int, cfg raft.Config, snap pb.Snapshot) er
 			// us to apply snapshots, append entries, and update the HardState.
 			Storage: s,
 			Config:  &cfg,
-			History: []pb.Snapshot{snap},
+			History: []*pb.Snapshot{snap},
 		}
 		env.Nodes = append(env.Nodes, node)
 	}

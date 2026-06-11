@@ -22,6 +22,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/proto"
 
 	pb "go.etcd.io/raft/v3/raftpb"
 )
@@ -31,10 +32,10 @@ var testFormatter EntryFormatter = func(data []byte) string {
 }
 
 func TestDescribeEntry(t *testing.T) {
-	entry := pb.Entry{
-		Term:  1,
-		Index: 2,
-		Type:  pb.EntryNormal,
+	entry := &pb.Entry{
+		Term:  new(uint64(1)),
+		Index: new(uint64(2)),
+		Type:  pb.EntryNormal.Enum(),
 		Data:  []byte("hello\x00world"),
 	}
 	require.Equal(t, `1/2 EntryNormal "hello\x00world"`, DescribeEntry(entry, nil))
@@ -42,23 +43,23 @@ func TestDescribeEntry(t *testing.T) {
 }
 
 func TestLimitSize(t *testing.T) {
-	ents := []pb.Entry{{Index: 4, Term: 4}, {Index: 5, Term: 5}, {Index: 6, Term: 6}}
-	prefix := func(size int) []pb.Entry {
-		return append([]pb.Entry{}, ents[:size]...) // protect the original slice
+	ents := []*pb.Entry{{Index: new(uint64(4)), Term: new(uint64(4))}, {Index: new(uint64(5)), Term: new(uint64(5))}, {Index: new(uint64(6)), Term: new(uint64(6))}}
+	prefix := func(size int) []*pb.Entry {
+		return append([]*pb.Entry{}, ents[:size]...) // protect the original slice
 	}
 	for _, tt := range []struct {
 		maxSize uint64
-		want    []pb.Entry
+		want    []*pb.Entry
 	}{
 		{math.MaxUint64, prefix(len(ents))}, // all entries are returned
 		// Even if maxSize is zero, the first entry should be returned.
 		{0, prefix(1)},
 		// Limit to 2.
-		{uint64(ents[0].Size() + ents[1].Size()), prefix(2)},
-		{uint64(ents[0].Size() + ents[1].Size() + ents[2].Size()/2), prefix(2)},
-		{uint64(ents[0].Size() + ents[1].Size() + ents[2].Size() - 1), prefix(2)},
+		{uint64(proto.Size(ents[0]) + proto.Size(ents[1])), prefix(2)},
+		{uint64(proto.Size(ents[0]) + proto.Size(ents[1]) + proto.Size(ents[2])/2), prefix(2)},
+		{uint64(proto.Size(ents[0]) + proto.Size(ents[1]) + proto.Size(ents[2]) - 1), prefix(2)},
 		// All.
-		{uint64(ents[0].Size() + ents[1].Size() + ents[2].Size()), prefix(3)},
+		{uint64(proto.Size(ents[0]) + proto.Size(ents[1]) + proto.Size(ents[2])), prefix(3)},
 	} {
 		t.Run("", func(t *testing.T) {
 			got := limitSize(ents, entryEncodingSize(tt.maxSize))
@@ -146,6 +147,6 @@ func TestIsResponseMsg(t *testing.T) {
 // This property is important because new leaders append an empty entry to their log,
 // and we don't want this to count towards the uncommitted log quota.
 func TestPayloadSizeOfEmptyEntry(t *testing.T) {
-	e := pb.Entry{Data: nil}
+	e := &pb.Entry{Data: nil}
 	require.Equal(t, 0, int(payloadSize(e)))
 }

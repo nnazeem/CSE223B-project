@@ -30,7 +30,7 @@ import (
 type rndConfChange pb.ConfState
 
 // Generate creates a random (valid) ConfState for use with quickcheck.
-func (rndConfChange) Generate(rand *rand.Rand, _ int) reflect.Value {
+func (*rndConfChange) Generate(rand *rand.Rand, _ int) reflect.Value {
 	conv := func(sl []int) []uint64 {
 		// We want IDs but the incoming slice is zero-indexed, so add one to
 		// each.
@@ -40,7 +40,7 @@ func (rndConfChange) Generate(rand *rand.Rand, _ int) reflect.Value {
 		}
 		return out
 	}
-	var cs pb.ConfState
+	cs := &pb.ConfState{}
 	// NB: never generate the empty ConfState, that one should be unit tested.
 	nVoters := 1 + rand.Intn(5)
 
@@ -79,14 +79,14 @@ func (rndConfChange) Generate(rand *rand.Rand, _ int) reflect.Value {
 		}
 	}
 
-	cs.AutoLeave = len(cs.VotersOutgoing) > 0 && rand.Intn(2) == 1
-	return reflect.ValueOf(rndConfChange(cs))
+	cs.AutoLeave = new(len(cs.VotersOutgoing) > 0 && rand.Intn(2) == 1)
+	return reflect.ValueOf((*rndConfChange)(cs))
 }
 
 func TestRestore(t *testing.T) {
 	cfg := quick.Config{MaxCount: 1000}
 
-	f := func(cs pb.ConfState) bool {
+	f := func(cs *pb.ConfState) bool {
 		chg := Changer{
 			Tracker:   tracker.MakeProgressTracker(20, 0),
 			LastIndex: 10,
@@ -121,18 +121,19 @@ func TestRestore(t *testing.T) {
 	}
 
 	// Unit tests.
-	for _, cs := range []pb.ConfState{
+	for _, cs := range []*pb.ConfState{
 		{},
 		{Voters: ids(1, 2, 3)},
 		{Voters: ids(1, 2, 3), Learners: ids(4, 5, 6)},
 		{Voters: ids(1, 2, 3), Learners: ids(5), VotersOutgoing: ids(1, 2, 4, 6), LearnersNext: ids(4)},
 	} {
+		pb.EnsureConfState(cs)
 		if !f(cs) {
 			t.FailNow() // f() already logged a nice t.Error()
 		}
 	}
 
-	assert.NoError(t, quick.Check(func(cs rndConfChange) bool {
-		return f(pb.ConfState(cs))
+	assert.NoError(t, quick.Check(func(cs *rndConfChange) bool {
+		return f((*pb.ConfState)(cs))
 	}, &cfg))
 }

@@ -1,20 +1,17 @@
 module go.etcd.io/raft/v3
 
-go 1.25
+go 1.26
 
-toolchain go1.25.10
+toolchain go1.26.3
 
 require (
 	github.com/cockroachdb/datadriven v1.0.2
-	github.com/gogo/protobuf v1.3.2
-	github.com/golang/protobuf v1.5.4
-	github.com/stretchr/testify v1.10.0
+	github.com/stretchr/testify v1.11.1
+	google.golang.org/protobuf v1.36.11
 )
 
 require (
 	github.com/davecgh/go-spew v1.1.1 // indirect
-	github.com/google/go-cmp v0.5.8 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
-	google.golang.org/protobuf v1.33.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
