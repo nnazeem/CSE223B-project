@@ -18,7 +18,7 @@ func newSignNodeForTest(selfID uint64, priv ed25519.PrivateKey, peerPubKeys map[
 		peerPubKeys: peerPubKeys,
 		cfg:         cfg,
 		lastSeen:    make(map[uint64]int64),
-		leaderSeen:  make(map[uint64]pb.Message),
+		leaderSeen:  make(map[uint64]*pb.Message),
 	}
 }
 
@@ -44,15 +44,15 @@ func TestAddAndVerifyLeaderProof(t *testing.T) {
 		LeaderProofQuorum: 2,
 	})
 
-	att2 := &pb.Message{Type: pb.MsgHeartbeatResp, From: 2, To: 1, Term: 7}
+	att2 := &pb.Message{Type: pb.MsgHeartbeatResp.Enum(), From: u64p(2), To: u64p(1), Term: u64p(7)}
 	signWithNode(t, now, 2, f2Priv, map[uint64]ed25519.PublicKey{1: leaderPub}, att2)
 	require.NoError(t, leader.verifyMessage(proto.Clone(att2).(*pb.Message)))
 
-	att3 := &pb.Message{Type: pb.MsgHeartbeatResp, From: 3, To: 1, Term: 7}
+	att3 := &pb.Message{Type: pb.MsgHeartbeatResp.Enum(), From: u64p(3), To: u64p(1), Term: u64p(7)}
 	signWithNode(t, now, 3, f3Priv, map[uint64]ed25519.PublicKey{1: leaderPub}, att3)
 	require.NoError(t, leader.verifyMessage(proto.Clone(att3).(*pb.Message)))
 
-	out := &pb.Message{Type: pb.MsgApp, From: 1, To: 2, Term: 7, Context: []byte("client-rctx")}
+	out := &pb.Message{Type: pb.MsgApp.Enum(), From: u64p(1), To: u64p(2), Term: u64p(7), Context: []byte("client-rctx")}
 	require.NoError(t, leader.AddLeaderProof(out))
 	require.NoError(t, leader.signMessage(out))
 
@@ -82,17 +82,16 @@ func TestAddLeaderProofInsufficientQuorum(t *testing.T) {
 		LeaderProofQuorum: 2,
 	})
 
-	att2 := &pb.Message{Type: pb.MsgHeartbeatResp, From: 2, To: 1, Term: 5}
+	att2 := &pb.Message{Type: pb.MsgHeartbeatResp.Enum(), From: u64p(2), To: u64p(1), Term: u64p(5)}
 	signWithNode(t, now, 2, f2Priv, map[uint64]ed25519.PublicKey{1: leaderPub}, att2)
 	require.NoError(t, leader.verifyMessage(proto.Clone(att2).(*pb.Message)))
 
-	out := &pb.Message{Type: pb.MsgApp, From: 1, To: 2, Term: 5}
+	out := &pb.Message{Type: pb.MsgApp.Enum(), From: u64p(1), To: u64p(2), Term: u64p(5)}
 	require.ErrorIs(t, leader.AddLeaderProof(out), ErrInsufficientLeaderProof)
 }
 
 func TestVerifyLeaderFailsOnStaleProof(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
-	// leader given larger tolerance than follower, so proof is stale for follower but not leader
 	leaderMaxAge := 2 * DefaultMaxMessageAge
 	old := now.Add(-(DefaultMaxMessageAge + time.Second))
 
@@ -109,14 +108,14 @@ func TestVerifyLeaderFailsOnStaleProof(t *testing.T) {
 		LeaderProofQuorum: 2,
 	})
 
-	att2 := &pb.Message{Type: pb.MsgHeartbeatResp, From: 2, To: 1, Term: 9}
+	att2 := &pb.Message{Type: pb.MsgHeartbeatResp.Enum(), From: u64p(2), To: u64p(1), Term: u64p(9)}
 	signWithNode(t, old, 2, f2Priv, map[uint64]ed25519.PublicKey{1: leaderPub}, att2)
 	require.NoError(t, leader.verifyMessage(proto.Clone(att2).(*pb.Message)))
-	att3 := &pb.Message{Type: pb.MsgHeartbeatResp, From: 3, To: 1, Term: 9}
+	att3 := &pb.Message{Type: pb.MsgHeartbeatResp.Enum(), From: u64p(3), To: u64p(1), Term: u64p(9)}
 	signWithNode(t, old, 3, f3Priv, map[uint64]ed25519.PublicKey{1: leaderPub}, att3)
 	require.NoError(t, leader.verifyMessage(proto.Clone(att3).(*pb.Message)))
 
-	out := &pb.Message{Type: pb.MsgApp, From: 1, To: 2, Term: 9}
+	out := &pb.Message{Type: pb.MsgApp.Enum(), From: u64p(1), To: u64p(2), Term: u64p(9)}
 	leader.cfg.Now = func() time.Time { return now }
 	require.NoError(t, leader.AddLeaderProof(out))
 	require.NoError(t, leader.signMessage(out))

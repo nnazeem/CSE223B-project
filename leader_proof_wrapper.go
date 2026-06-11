@@ -29,7 +29,7 @@ func (sn *SignNode) AddLeaderProof(m *pb.Message) error {
 	if q <= 0 {
 		return nil
 	}
-	proofs := sn.collectLeaderAttestations(m.Term)
+	proofs := sn.collectLeaderAttestations(m.GetTerm())
 	if len(proofs) < q {
 		return ErrInsufficientLeaderProof
 	}
@@ -58,13 +58,13 @@ func (sn *SignNode) VerifyLeader(m *pb.Message) error {
 	// Double-check that proofs are valid, fresh, and from unique peers before trusting the original context.
 	for i := range proofs {
 		p := proofs[i]
-		if !isLeaderAttestationMessage(&p, m.From) {
+		if !isLeaderAttestationMessage(p, m.GetFrom()) {
 			continue
 		}
-		if p.Term != m.Term {
+		if p.GetTerm() != m.GetTerm() {
 			continue
 		}
-		if _, dup := seen[p.From]; dup {
+		if _, dup := seen[p.GetFrom()]; dup {
 			continue
 		}
 		sig, ts, proofCtx, err := parseSignature(p.Context)
@@ -74,18 +74,18 @@ func (sn *SignNode) VerifyLeader(m *pb.Message) error {
 		if !timestampWithinAge(now, ts, maxAge) {
 			continue
 		}
-		pub, ok := sn.attestationPubKey(p.From)
+		pub, ok := sn.attestationPubKey(p.GetFrom())
 		if !ok {
 			continue
 		}
-		data, err := messageSignBytes(&p, proofCtx, ts)
+		data, err := messageSignBytes(p, proofCtx, ts)
 		if err != nil {
 			continue
 		}
 		if !ed25519.Verify(pub, data, sig) {
 			continue
 		}
-		seen[p.From] = struct{}{}
+		seen[p.GetFrom()] = struct{}{}
 		if len(seen) >= q {
 			m.Context = origCtx
 			return nil
@@ -95,25 +95,25 @@ func (sn *SignNode) VerifyLeader(m *pb.Message) error {
 }
 
 func shouldAttachLeaderProof(m *pb.Message, selfID uint64, peerPubKeys map[uint64]ed25519.PublicKey, clientIDs map[uint64]struct{}, clientPub ed25519.PublicKey, q int) bool {
-	if q <= 0 || m.From != selfID || isInternalMessage(m) || IsResponseMsg(m.Type) {
+	if q <= 0 || m.GetFrom() != selfID || isInternalMessage(m) || IsResponseMsg(m.GetType()) {
 		return false
 	}
-	return isPeerOrClient(m.To, selfID, peerPubKeys, clientIDs, clientPub)
+	return isPeerOrClient(m.GetTo(), selfID, peerPubKeys, clientIDs, clientPub)
 }
 
 func shouldVerifyLeaderProof(m *pb.Message, selfID uint64, peerPubKeys map[uint64]ed25519.PublicKey, q int) bool {
-	if q <= 0 || isInternalMessage(m) || IsResponseMsg(m.Type) {
+	if q <= 0 || isInternalMessage(m) || IsResponseMsg(m.GetType()) {
 		return false
 	}
-	if m.From == 0 || m.From == selfID {
+	if m.GetFrom() == 0 || m.GetFrom() == selfID {
 		return false
 	}
-	_, ok := peerPubKeys[m.From]
+	_, ok := peerPubKeys[m.GetFrom()]
 	return ok
 }
 
 func shouldRecordLeaderAttestation(m *pb.Message, selfID uint64, peerPubKeys map[uint64]ed25519.PublicKey) bool {
-	_, ok := peerPubKeys[m.From]
+	_, ok := peerPubKeys[m.GetFrom()]
 	if !ok {
 		return false
 	}
@@ -121,51 +121,51 @@ func shouldRecordLeaderAttestation(m *pb.Message, selfID uint64, peerPubKeys map
 }
 
 func isLeaderAttestationMessage(m *pb.Message, expectedLeader uint64) bool {
-	if m.To != expectedLeader || m.From == 0 || m.From == expectedLeader {
+	if m.GetTo() != expectedLeader || m.GetFrom() == 0 || m.GetFrom() == expectedLeader {
 		return false
 	}
-	return m.Type == pb.MsgHeartbeatResp || m.Type == pb.MsgAppResp
+	return m.GetType() == pb.MsgHeartbeatResp || m.GetType() == pb.MsgAppResp
 }
 
 func (sn *SignNode) recordLeaderAttestation(m *pb.Message, ts int64) {
 	sn.mu.Lock()
 	defer sn.mu.Unlock()
-	if cur, ok := sn.leaderSeen[m.From]; ok {
+	if cur, ok := sn.leaderSeen[m.GetFrom()]; ok {
 		_, curTS, _, err := parseSignature(cur.Context)
 		if err == nil && ts <= curTS {
 			return
 		}
 	}
-	sn.leaderSeen[m.From] = *proto.Clone(m).(*pb.Message)
+	sn.leaderSeen[m.GetFrom()] = proto.Clone(m).(*pb.Message)
 }
 
-func (sn *SignNode) collectLeaderAttestations(term uint64) []pb.Message {
+func (sn *SignNode) collectLeaderAttestations(term uint64) []*pb.Message {
 	now := sn.cfg.now().UnixNano()
 	maxAge := sn.cfg.maxAge().Nanoseconds()
 
 	sn.mu.Lock()
 	defer sn.mu.Unlock()
 
-	out := make([]pb.Message, 0, len(sn.leaderSeen))
+	out := make([]*pb.Message, 0, len(sn.leaderSeen))
 	for _, m := range sn.leaderSeen {
-		if m.Term != term {
+		if m.GetTerm() != term {
 			continue
 		}
 		_, ts, _, err := parseSignature(m.Context)
 		if err != nil || !timestampWithinAge(now, ts, maxAge) {
 			continue
 		}
-		out = append(out, *proto.Clone(&m).(*pb.Message))
+		out = append(out, proto.Clone(m).(*pb.Message))
 	}
 	return out
 }
 
-func packLeaderProof(origCtx []byte, proofs []pb.Message) []byte {
+func packLeaderProof(origCtx []byte, proofs []*pb.Message) []byte {
 	origCtx = normalizeContext(origCtx)
 	encoded := make([][]byte, len(proofs))
 	total := leaderProofOverhead + len(origCtx)
 	for i := range proofs {
-		b, err := proto.Marshal(&proofs[i])
+		b, err := proto.Marshal(proofs[i])
 		if err != nil {
 			panic(err)
 		}
@@ -188,7 +188,7 @@ func packLeaderProof(origCtx []byte, proofs []pb.Message) []byte {
 	return out
 }
 
-func parseLeaderProof(ctx []byte) (origCtx []byte, proofs []pb.Message, err error) {
+func parseLeaderProof(ctx []byte) (origCtx []byte, proofs []*pb.Message, err error) {
 	if len(ctx) < leaderProofOverhead {
 		return nil, nil, ErrInvalidLeaderProof
 	}
@@ -203,7 +203,7 @@ func parseLeaderProof(ctx []byte) (origCtx []byte, proofs []pb.Message, err erro
 	}
 	origCtx = normalizeContext(ctx[pos : pos+origLen])
 	pos += origLen
-	proofs = make([]pb.Message, 0, count)
+	proofs = make([]*pb.Message, 0, count)
 	for i := 0; i < count; i++ {
 		if pos+4 > len(ctx) {
 			return nil, nil, ErrInvalidLeaderProof
@@ -217,7 +217,7 @@ func parseLeaderProof(ctx []byte) (origCtx []byte, proofs []pb.Message, err erro
 		if err := proto.Unmarshal(ctx[pos:pos+n], &m); err != nil {
 			return nil, nil, ErrInvalidLeaderProof
 		}
-		proofs = append(proofs, m)
+		proofs = append(proofs, &m)
 		pos += n
 	}
 	if pos != len(ctx) {

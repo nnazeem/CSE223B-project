@@ -79,7 +79,7 @@ type SignNode struct {
 	mu        sync.Mutex
 	lastSeen  map[uint64]int64 // sender ID -> last accepted unix nanos
 	localSent int64            // last timestamp used when signing outbound messages
-	leaderSeen map[uint64]pb.Message
+	leaderSeen map[uint64]*pb.Message
 
 	readyc chan Ready
 	done   chan struct{}
@@ -111,7 +111,7 @@ func WrapNode(
 		clientPub:   clientPub,
 		cfg:         c,
 		lastSeen:    make(map[uint64]int64),
-		leaderSeen:  make(map[uint64]pb.Message),
+		leaderSeen:  make(map[uint64]*pb.Message),
 		readyc:      make(chan Ready),
 		done:        make(chan struct{}),
 	}
@@ -151,7 +151,7 @@ func (sn *SignNode) Step(ctx context.Context, m *pb.Message) error {
 			return err
 		}
 	}
-	return sn.Node.Step(ctx, *m)
+	return sn.Node.Step(ctx, m)
 }
 
 func (sn *SignNode) Stop() {
@@ -163,19 +163,19 @@ func (sn *SignNode) Stop() {
 	sn.Node.Stop()
 }
 
-func (sn *SignNode) signMessages(msgs []pb.Message) []pb.Message {
+func (sn *SignNode) signMessages(msgs []*pb.Message) []*pb.Message {
 	if len(msgs) == 0 {
 		return msgs
 	}
-	out := make([]pb.Message, len(msgs))
+	out := make([]*pb.Message, len(msgs))
 	for i, m := range msgs {
 		out[i] = sn.signMessageTree(m)
 	}
 	return out
 }
 
-func (sn *SignNode) signMessageTree(m pb.Message) pb.Message {
-	mm := proto.Clone(&m).(*pb.Message)
+func (sn *SignNode) signMessageTree(m *pb.Message) *pb.Message {
+	mm := proto.Clone(m).(*pb.Message)
 	if shouldAttachLeaderProof(mm, sn.selfID, sn.peerPubKeys, sn.clientIDs, sn.clientPub, sn.cfg.leaderProofQuorum()) {
 		if err := sn.AddLeaderProof(mm); err != nil {
 			panic(err)
@@ -189,7 +189,7 @@ func (sn *SignNode) signMessageTree(m pb.Message) pb.Message {
 	for i := range mm.Responses {
 		mm.Responses[i] = sn.signMessageTree(mm.Responses[i])
 	}
-	return *mm
+	return mm
 }
 
 func (sn *SignNode) verifyMessage(m *pb.Message) error {
@@ -204,10 +204,10 @@ func (sn *SignNode) verifyMessage(m *pb.Message) error {
 	if err != nil {
 		return err
 	}
-	if err := sn.checkFreshness(m.From, ts); err != nil {
+	if err := sn.checkFreshness(m.GetFrom(), ts); err != nil {
 		return err
 	}
-	pub, ok := lookupPubKey(m.From, sn.peerPubKeys, sn.clientIDs, sn.clientPub)
+	pub, ok := lookupPubKey(m.GetFrom(), sn.peerPubKeys, sn.clientIDs, sn.clientPub)
 	if !ok {
 		return ErrUnknownSigner
 	}
@@ -218,13 +218,13 @@ func (sn *SignNode) verifyMessage(m *pb.Message) error {
 	if !ed25519.Verify(pub, data, sig) {
 		return ErrInvalidSignature
 	}
-	sn.recordSeen(m.From, ts)
+	sn.recordSeen(m.GetFrom(), ts)
 	if signedForProof != nil {
 		sn.recordLeaderAttestation(signedForProof, ts)
 	}
 	m.Context = origCtx
 	for i := range m.Responses {
-		if err := sn.verifyMessage(&m.Responses[i]); err != nil {
+		if err := sn.verifyMessage(m.Responses[i]); err != nil {
 			return err
 		}
 	}
@@ -322,7 +322,7 @@ func shouldSign(m *pb.Message, selfID uint64, peerPubKeys map[uint64]ed25519.Pub
 	if isInternalMessage(m) {
 		return false
 	}
-	return isPeerOrClient(m.To, selfID, peerPubKeys, clientIDs, clientPub)
+	return isPeerOrClient(m.GetTo(), selfID, peerPubKeys, clientIDs, clientPub)
 }
 
 // shouldVerify reports whether an inbound message must carry a valid signature.
@@ -330,14 +330,14 @@ func shouldVerify(m *pb.Message, selfID uint64, peerPubKeys map[uint64]ed25519.P
 	if isInternalMessage(m) {
 		return false
 	}
-	return isPeerOrClient(m.From, selfID, peerPubKeys, clientIDs, clientPub)
+	return isPeerOrClient(m.GetFrom(), selfID, peerPubKeys, clientIDs, clientPub)
 }
 
 func isInternalMessage(m *pb.Message) bool {
-	if IsLocalMsg(m.Type) {
+	if IsLocalMsg(m.GetType()) {
 		return true
 	}
-	if IsLocalMsgTarget(m.To) || IsLocalMsgTarget(m.From) {
+	if IsLocalMsgTarget(m.GetTo()) || IsLocalMsgTarget(m.GetFrom()) {
 		return true
 	}
 	return false

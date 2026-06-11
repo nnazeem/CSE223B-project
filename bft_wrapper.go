@@ -10,6 +10,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/golang/protobuf/proto"
+
 	pb "go.etcd.io/raft/v3/raftpb"
 )
 
@@ -121,12 +123,12 @@ type BFTNode struct {
 	priv        ed25519.PrivateKey
 
 	view uint64
-	log  []pb.Entry
+	log  []*pb.Entry
 
 	pp       map[bftSeqKey][32]byte
 	prepares map[bftSeqKey]map[uint64]struct{}
 	commits  map[bftSeqKey]map[uint64]struct{}
-	reqs     map[bftSeqKey][]pb.Entry // Buffer to hold full payloads during PBFT consensus
+	reqs     map[bftSeqKey][]*pb.Entry // Buffer to hold full payloads during PBFT consensus
 
 	lowW     uint64
 	highW    uint64
@@ -137,7 +139,7 @@ type BFTNode struct {
 	mu         sync.Mutex
 	clientSeen map[uint64]int64
 
-	bftMsgs  []pb.Message
+	bftMsgs  []*pb.Message
 	readyc   chan Ready
 	triggerc chan struct{}
 	advancec chan struct{}
@@ -167,14 +169,14 @@ func WrapBFTNode(
 		pp:       make(map[bftSeqKey][32]byte),
 		prepares: make(map[bftSeqKey]map[uint64]struct{}),
 		commits:  make(map[bftSeqKey]map[uint64]struct{}),
-		reqs:     make(map[bftSeqKey][]pb.Entry),
+		reqs:     make(map[bftSeqKey][]*pb.Entry),
 
 		lowW:     0,
 		highW:    2000,
 		nextSeqN: 1,
 
 		clientSeen: make(map[uint64]int64),
-		bftMsgs:    make([]pb.Message, 0),
+		bftMsgs:    make([]*pb.Message, 0),
 		readyc:     make(chan Ready),
 		triggerc:   make(chan struct{}, 1),
 		advancec:   make(chan struct{}),
@@ -184,11 +186,11 @@ func WrapBFTNode(
 	return bn
 }
 
-func (bn *BFTNode) signOutboundMessages(msgs []pb.Message) {
+func (bn *BFTNode) signOutboundMessages(msgs []*pb.Message) {
 	for i := range msgs {
 		ts := bn.cfg.now().UnixNano()
 		origCtx := normalizeContext(msgs[i].Context)
-		dataSign, err := messageSignBytes(&msgs[i], origCtx, ts)
+		dataSign, err := messageSignBytes(msgs[i], origCtx, ts)
 		if err == nil {
 			sig := ed25519.Sign(bn.priv, dataSign)
 			msgs[i].Context = packSignature(sig, ts, origCtx)
@@ -264,7 +266,7 @@ func (bn *BFTNode) Step(ctx context.Context, m *pb.Message) error {
 	}()
 
 	if bn.isInternalMessage(m) {
-		return bn.Node.Step(ctx, *m)
+		return bn.Node.Step(ctx, m)
 	}
 
 	if err := bn.verifyMessage(m); err != nil {
@@ -305,7 +307,7 @@ func (bn *BFTNode) Step(ctx context.Context, m *pb.Message) error {
 	// TUNNEL: Pass authenticated native Raft traffic to the inner core!
 	if err != nil || bctx.Phase == PhaseUnknown {
 		bn.mu.Unlock()
-		return bn.Node.Step(ctx, *m)
+		return bn.Node.Step(ctx, m)
 	}
 
 	key := bftSeqKey{view: bctx.View, seq: bctx.SeqNum}
@@ -341,7 +343,7 @@ func (bn *BFTNode) Step(ctx context.Context, m *pb.Message) error {
 			bn.prepares[key] = make(map[uint64]struct{})
 		}
 
-		bn.prepares[key][m.From] = struct{}{}
+		bn.prepares[key][m.GetFrom()] = struct{}{}
 		wasBelow := uint64(len(bn.prepares[key])) < (2*bn.f + 1)
 		bn.prepares[key][bn.selfID] = struct{}{} // Self-vote
 		isAbove := uint64(len(bn.prepares[key])) >= (2*bn.f + 1)
@@ -376,7 +378,7 @@ func (bn *BFTNode) Step(ctx context.Context, m *pb.Message) error {
 		}
 
 		wasBelow := uint64(len(bn.prepares[key])) < (2*bn.f + 1)
-		bn.prepares[key][m.From] = struct{}{}
+		bn.prepares[key][m.GetFrom()] = struct{}{}
 		isAbove := uint64(len(bn.prepares[key])) >= (2*bn.f + 1)
 
 		if wasBelow && isAbove {
@@ -407,7 +409,7 @@ func (bn *BFTNode) Step(ctx context.Context, m *pb.Message) error {
 		}
 
 		wasBelow := uint64(len(bn.commits[key])) < (2*bn.f + 1)
-		bn.commits[key][m.From] = struct{}{}
+		bn.commits[key][m.GetFrom()] = struct{}{}
 		isAbove := uint64(len(bn.commits[key])) >= (2*bn.f + 1)
 
 		if wasBelow && isAbove {
@@ -435,7 +437,7 @@ func (bn *BFTNode) verifyMessage(m *pb.Message) error {
 		return bn.VerifyClient(m)
 	}
 
-	pubKey, ok := bn.nodePubKeys[m.From]
+	pubKey, ok := bn.nodePubKeys[m.GetFrom()]
 	if !ok {
 		return ErrUnknownSigner
 	}
@@ -449,7 +451,7 @@ func (bn *BFTNode) verifyMessage(m *pb.Message) error {
 }
 
 func (bn *BFTNode) VerifyClient(m *pb.Message) error {
-	if _, ok := bn.clientIDs[m.From]; !ok {
+	if _, ok := bn.clientIDs[m.GetFrom()]; !ok {
 		return ErrUnknownSigner
 	}
 
@@ -459,11 +461,11 @@ func (bn *BFTNode) VerifyClient(m *pb.Message) error {
 	}
 
 	bn.mu.Lock()
-	if last, ok := bn.clientSeen[m.From]; ok && ts <= last {
+	if last, ok := bn.clientSeen[m.GetFrom()]; ok && ts <= last {
 		bn.mu.Unlock()
 		return ErrStaleMessage
 	}
-	bn.clientSeen[m.From] = ts
+	bn.clientSeen[m.GetFrom()] = ts
 	bn.mu.Unlock()
 
 	m.Context = origCtx
@@ -475,8 +477,8 @@ func (bn *BFTNode) ConstructPP(m *pb.Message) (BFTContext, *pb.Message, error) {
 	bn.nextSeqN++
 
 	var data []byte
-	if len(m.Entries) > 0 {
-		data = m.Entries[0].Data
+	if entries := m.GetEntries(); len(entries) > 0 && entries[0] != nil {
+		data = entries[0].Data
 	}
 	bctx := BFTContext{Phase: PhasePrePrepare, View: bn.view, SeqNum: seq, Digest: hashData(data)}
 	encCtx, err := encodeBFTContext(bctx)
@@ -484,7 +486,12 @@ func (bn *BFTNode) ConstructPP(m *pb.Message) (BFTContext, *pb.Message, error) {
 		return bctx, nil, err
 	}
 
-	return bctx, &pb.Message{Type: pb.MsgApp, From: bn.selfID, Context: encCtx, Entries: m.Entries}, nil
+	return bctx, &pb.Message{
+		Type:    pb.MsgApp.Enum(),
+		From:    new(uint64(bn.selfID)),
+		Context: encCtx,
+		Entries: m.Entries,
+	}, nil
 }
 
 func (bn *BFTNode) ConstructP(bctx BFTContext) (*pb.Message, error) {
@@ -493,7 +500,7 @@ func (bn *BFTNode) ConstructP(bctx BFTContext) (*pb.Message, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &pb.Message{Type: pb.MsgApp, From: bn.selfID, Context: encCtx}, nil
+	return &pb.Message{Type: pb.MsgApp.Enum(), From: new(uint64(bn.selfID)), Context: encCtx}, nil
 }
 
 func (bn *BFTNode) ConstructC(bctx BFTContext) (*pb.Message, error) {
@@ -502,7 +509,7 @@ func (bn *BFTNode) ConstructC(bctx BFTContext) (*pb.Message, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &pb.Message{Type: pb.MsgApp, From: bn.selfID, Context: encCtx}, nil
+	return &pb.Message{Type: pb.MsgApp.Enum(), From: new(uint64(bn.selfID)), Context: encCtx}, nil
 }
 
 func (bn *BFTNode) broadcast(m *pb.Message) {
@@ -510,18 +517,18 @@ func (bn *BFTNode) broadcast(m *pb.Message) {
 		if id == bn.selfID {
 			continue
 		}
-		mCopy := *m
-		mCopy.To = id
+		mCopy := proto.Clone(m).(*pb.Message)
+		mCopy.To = new(uint64(id))
 		bn.bftMsgs = append(bn.bftMsgs, mCopy)
 	}
 }
 
 func (bn *BFTNode) isLeader() bool { return (bn.view%bn.n)+1 == bn.selfID }
 func (bn *BFTNode) isInternalMessage(m *pb.Message) bool {
-	return IsLocalMsg(m.Type) || IsLocalMsgTarget(m.To) || IsLocalMsgTarget(m.From)
+	return IsLocalMsg(m.GetType()) || IsLocalMsgTarget(m.GetTo()) || IsLocalMsgTarget(m.GetFrom())
 }
 func (bn *BFTNode) isClientRequest(m *pb.Message) bool {
-	return m != nil && m.Type == pb.MsgProp
+	return m != nil && m.GetType() == pb.MsgProp
 }
 
 // ====================================================================
@@ -529,7 +536,7 @@ func (bn *BFTNode) isClientRequest(m *pb.Message) bool {
 // ====================================================================
 
 type pendingRequest struct {
-	msg       pb.Message
+	msg       *pb.Message
 	timestamp int64
 	ticks     int
 }
@@ -550,7 +557,7 @@ type BFTClient struct {
 
 	mu         sync.Mutex
 	lastSent   int64
-	readyc     chan pb.Message
+	readyc     chan *pb.Message
 	ConsensusC chan []byte
 }
 
@@ -574,7 +581,7 @@ func NewBFTClient(
 		cfg:         c,
 		pending:     make(map[int64]*pendingRequest),
 		replies:     make(map[int64]map[uint64][]byte),
-		readyc:      make(chan pb.Message, 100),
+		readyc:      make(chan *pb.Message, 100),
 		ConsensusC:  make(chan []byte, 10),
 	}
 }
@@ -587,11 +594,11 @@ func (c *BFTClient) Tick() {
 		req.ticks++
 		if req.ticks > 10 {
 			for id := uint64(1); id <= c.n; id++ {
-				mCopy := req.msg
-				mCopy.To = id
+				mCopy := proto.Clone(req.msg).(*pb.Message)
+				mCopy.To = new(uint64(id))
 
 				origCtx := normalizeContext(mCopy.Context)
-				dataSign, _ := messageSignBytes(&mCopy, origCtx, ts)
+				dataSign, _ := messageSignBytes(mCopy, origCtx, ts)
 				sig := ed25519.Sign(c.priv, dataSign)
 				mCopy.Context = packSignature(sig, ts, origCtx)
 
@@ -603,7 +610,7 @@ func (c *BFTClient) Tick() {
 	}
 }
 
-func (c *BFTClient) Ready() <-chan pb.Message { return c.readyc }
+func (c *BFTClient) Ready() <-chan *pb.Message { return c.readyc }
 
 func (c *BFTClient) Propose(ctx context.Context, data []byte) error {
 	c.mu.Lock()
@@ -614,10 +621,10 @@ func (c *BFTClient) Propose(ctx context.Context, data []byte) error {
 	c.lastSent = ts
 	c.mu.Unlock()
 
-	baseMsg := pb.Message{
-		Type:    pb.MsgProp,
-		From:    c.selfID,
-		Entries: []pb.Entry{{Data: data}},
+	baseMsg := &pb.Message{
+		Type:    pb.MsgProp.Enum(),
+		From:    new(uint64(c.selfID)),
+		Entries: []*pb.Entry{{Data: data}},
 	}
 
 	c.mu.Lock()
@@ -625,11 +632,11 @@ func (c *BFTClient) Propose(ctx context.Context, data []byte) error {
 	c.mu.Unlock()
 
 	for id := uint64(1); id <= c.n; id++ {
-		mCopy := baseMsg
-		mCopy.To = id
+		mCopy := proto.Clone(baseMsg).(*pb.Message)
+		mCopy.To = new(uint64(id))
 
 		origCtx := normalizeContext(mCopy.Context)
-		dataSign, err := messageSignBytes(&mCopy, origCtx, ts)
+		dataSign, err := messageSignBytes(mCopy, origCtx, ts)
 		if err != nil {
 			return err
 		}
@@ -670,7 +677,7 @@ func (c *BFTClient) Step(ctx context.Context, m *pb.Message) error {
 	if c.replies[ts] == nil {
 		c.replies[ts] = make(map[uint64][]byte)
 	}
-	c.replies[ts][m.From] = bctx.Result
+	c.replies[ts][m.GetFrom()] = bctx.Result
 
 	resultCounts := make(map[string]uint64)
 	for _, res := range c.replies[ts] {
@@ -691,7 +698,7 @@ func (c *BFTClient) Step(ctx context.Context, m *pb.Message) error {
 }
 
 func (c *BFTClient) verifyMessage(m *pb.Message) (int64, error) {
-	pubKey, ok := c.nodePubKeys[m.From]
+	pubKey, ok := c.nodePubKeys[m.GetFrom()]
 	if !ok {
 		return 0, ErrUnknownSigner
 	}
@@ -706,7 +713,7 @@ func (c *BFTClient) verifyMessage(m *pb.Message) (int64, error) {
 }
 
 func (c *BFTClient) AddClientProof(m *pb.Message) (int64, error) {
-	m.From = c.selfID
+	m.From = new(uint64(c.selfID))
 	origCtx := normalizeContext(m.Context)
 
 	c.mu.Lock()
