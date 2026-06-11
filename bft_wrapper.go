@@ -1,14 +1,10 @@
 package raft
 
 import (
-	"bytes"
 	"context"
 	"crypto/ed25519"
-	"crypto/sha256"
-	"encoding/gob"
 	"errors"
 	"sync"
-	"time"
 
 	"github.com/golang/protobuf/proto"
 
@@ -19,94 +15,108 @@ import (
 // BFT Context & Types
 // ====================================================================
 
-type BFTPhase uint8
+// type BFTPhase uint8
 
-const (
-	PhaseUnknown BFTPhase = iota
-	PhasePrePrepare
-	PhasePrepare
-	PhaseCommit
-	PhaseReply
-)
+// const (
+// 	PhaseUnknown BFTPhase = iota
+// 	PhasePrePrepare
+// 	PhasePrepare
+// 	PhaseCommit
+// 	PhaseReply
+// )
 
-type BFTContext struct {
-	Phase  BFTPhase
-	View   uint64
-	SeqNum uint64
-	Digest [32]byte
-	Result []byte // For PhaseReply
-}
+// type BFTContext struct {
+// 	Phase  BFTPhase
+// 	View   uint64
+// 	SeqNum uint64
+// 	Digest [32]byte
+// 	Result []byte // For PhaseReply
+// }
 
 type bftSeqKey struct {
 	view uint64
 	seq  uint64
 }
 
-type ClientProofConfig struct {
-	MaxAge time.Duration
-	Now    func() time.Time
-}
-
-func (c *ClientProofConfig) maxAge() time.Duration {
-	if c == nil || c.MaxAge <= 0 {
-		return DefaultMaxMessageAge
+// shouldSign reports whether an outbound message must be signed before delivery.
+func clientIDSet(ids []uint64) map[uint64]struct{} {
+	if len(ids) == 0 {
+		return nil
 	}
-	return c.MaxAge
-}
-
-func (c *ClientProofConfig) now() time.Time {
-	if c == nil || c.Now == nil {
-		return time.Now()
+	set := make(map[uint64]struct{}, len(ids))
+	for _, id := range ids {
+		if id != 0 {
+			set[id] = struct{}{}
+		}
 	}
-	return c.Now()
+	return set
 }
 
-func hashData(data []byte) [32]byte {
-	return sha256.Sum256(data)
-}
+// type ClientProofConfig struct {
+// 	MaxAge time.Duration
+// 	Now    func() time.Time
+// }
 
-func encodeBFTContext(bctx BFTContext) ([]byte, error) {
-	var buf bytes.Buffer
-	if err := gob.NewEncoder(&buf).Encode(bctx); err != nil {
-		return nil, err
-	}
-	return buf.Bytes(), nil
-}
+// func (c *ClientProofConfig) maxAge() time.Duration {
+// 	if c == nil || c.MaxAge <= 0 {
+// 		return DefaultMaxMessageAge
+// 	}
+// 	return c.MaxAge
+// }
 
-func decodeBFTContext(data []byte) (BFTContext, error) {
-	var bctx BFTContext
-	if len(data) == 0 {
-		return bctx, nil
-	}
-	err := gob.NewDecoder(bytes.NewReader(data)).Decode(&bctx)
-	return bctx, err
-}
+// func (c *ClientProofConfig) now() time.Time {
+// 	if c == nil || c.Now == nil {
+// 		return time.Now()
+// 	}
+// 	return c.Now()
+// }
+
+// func hashData(data []byte) [32]byte {
+// 	return sha256.Sum256(data)
+// }
+
+// func encodeBFTContext(bctx BFTContext) ([]byte, error) {
+// 	var buf bytes.Buffer
+// 	if err := gob.NewEncoder(&buf).Encode(bctx); err != nil {
+// 		return nil, err
+// 	}
+// 	return buf.Bytes(), nil
+// }
+
+// func decodeBFTContext(data []byte) (BFTContext, error) {
+// 	var bctx BFTContext
+// 	if len(data) == 0 {
+// 		return bctx, nil
+// 	}
+// 	err := gob.NewDecoder(bytes.NewReader(data)).Decode(&bctx)
+// 	return bctx, err
+// }
 
 // ====================================================================
 // Shared Cryptographic Utility
 // ====================================================================
 
-func VerifyBFTMessageSignature(m *pb.Message, pubKey ed25519.PublicKey) (int64, []byte, error) {
-	if len(pubKey) == 0 {
-		return 0, nil, ErrUnknownSigner
-	}
+// func VerifyBFTMessageSignature(m *pb.Message, pubKey ed25519.PublicKey) (int64, []byte, error) {
+// 	if len(pubKey) == 0 {
+// 		return 0, nil, ErrUnknownSigner
+// 	}
 
-	sig, ts, origCtx, err := parseSignature(m.Context)
-	if err != nil {
-		return 0, nil, err
-	}
+// 	sig, ts, origCtx, err := parseSignature(m.Context)
+// 	if err != nil {
+// 		return 0, nil, err
+// 	}
 
-	data, err := messageSignBytes(m, origCtx, ts)
-	if err != nil {
-		return 0, nil, err
-	}
+// 	data, err := messageSignBytes(m, origCtx, ts)
+// 	if err != nil {
+// 		return 0, nil, err
+// 	}
 
-	if !ed25519.Verify(pubKey, data, sig) {
-		return 0, nil, ErrInvalidSignature
-	}
+// 	if !ed25519.Verify(pubKey, data, sig) {
+// 		return 0, nil, ErrInvalidSignature
+// 	}
 
-	return ts, origCtx, nil
-}
+// 	return ts, origCtx, nil
+// }
 
 // ====================================================================
 // BFT Node Implementation

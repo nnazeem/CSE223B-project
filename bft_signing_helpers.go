@@ -24,6 +24,8 @@ var (
 	ErrStaleMessage     = errors.New("raft: stale message")
 )
 
+func u64p(v uint64) *uint64 { return &v }
+
 // VerifyBFTMessageSignature verifies the signed envelope embedded in message context.
 // It returns the signed timestamp and the original, unsigned context payload.
 func VerifyBFTMessageSignature(m *pb.Message, pubKey ed25519.PublicKey) (int64, []byte, error) {
