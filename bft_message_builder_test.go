@@ -170,7 +170,7 @@ func TestBFTMessageBuilder_ConstructViewChange(t *testing.T) {
 	builder := NewBFTMessageBuilder(2, priv, &ClientProofConfig{Now: func() time.Time { return now }})
 
 	digest := hashData([]byte("m"))
-	checkpointProofs := []BFTPreparedProof{{View: 8, SeqNum: 70, Digest: hashData([]byte("cp"))}}
+	checkpointProofs := []BFTCheckpointProof{{ReplicaID: 1, SeqNum: 70, Digest: hashData([]byte("cp"))}}
 	preparedProofs := []BFTPreparedProof{{View: 9, SeqNum: 77, Digest: digest}}
 	vcMsg, _, err := builder.ConstructViewChange(5, 10, 70, checkpointProofs, preparedProofs)
 	require.NoError(t, err)

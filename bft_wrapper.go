@@ -33,6 +33,20 @@ import (
 // 	Result []byte // For PhaseReply
 // }
 
+type Checkpoint struct {
+	SeqNum  uint64
+	Digest  [32]byte
+	Replica uint64
+	Sig     []byte
+}
+
+type StableCheckpoint struct {
+	SeqNum uint64
+	Digest [32]byte
+
+	Proofs []BFTCheckpointProof // proofs of the stable checkpoint, should be 2f+1
+}
+
 type bftSeqKey struct {
 	view uint64
 	seq  uint64
@@ -122,6 +136,13 @@ func clientIDSet(ids []uint64) map[uint64]struct{} {
 // BFT Node Implementation
 // ====================================================================
 
+const (
+	// CheckpointInterval (X): create a checkpoint every X executed sequence numbers.
+	CheckpointInterval = 100
+	// WatermarkWindow (k): H = h + k; must be greater than CheckpointInterval.
+	WatermarkWindow = 200
+)
+
 type BFTNode struct {
 	Node
 	selfID      uint64
@@ -153,6 +174,10 @@ type BFTNode struct {
 	readyc   chan Ready
 	triggerc chan struct{}
 	advancec chan struct{}
+
+	checkpoints map[uint64]map[[32]byte]map[uint64]*Checkpoint
+
+	stableCheckpoint *StableCheckpoint
 }
 
 func WrapBFTNode(
@@ -182,7 +207,7 @@ func WrapBFTNode(
 		reqs:     make(map[bftSeqKey][]*pb.Entry),
 
 		lowW:     0,
-		highW:    2000,
+		highW:    WatermarkWindow,
 		nextSeqN: 1,
 
 		clientSeen: make(map[uint64]int64),
@@ -190,6 +215,9 @@ func WrapBFTNode(
 		readyc:     make(chan Ready),
 		triggerc:   make(chan struct{}, 1),
 		advancec:   make(chan struct{}),
+
+		checkpoints: make(map[uint64]map[[32]byte]map[uint64]*Checkpoint),
+		stableCheckpoint: nil,
 	}
 
 	go bn.forwardReady()
@@ -323,6 +351,12 @@ func (bn *BFTNode) Step(ctx context.Context, m *pb.Message) error {
 	key := bftSeqKey{view: bctx.View, seq: bctx.SeqNum}
 
 	switch bctx.Phase {
+	case PhaseCheckpoint:
+		seq := bctx.CheckpointSeqNum
+		dig := bctx.CheckpointDigest
+		bn.acceptCheckpoint(seq, dig, m.GetFrom())
+		bn.mu.Unlock()
+		return nil
 	case PhasePrePrepare:
 		if bctx.View != bn.view {
 			bn.mu.Unlock()
@@ -374,11 +408,7 @@ func (bn *BFTNode) Step(ctx context.Context, m *pb.Message) error {
 			bn.broadcast(cMsg)
 
 			if uint64(len(bn.commits[key])) >= (2*bn.f + 1) {
-				if entries, ok := bn.reqs[key]; ok {
-					for _, ent := range entries {
-						pendingProposals = append(pendingProposals, ent.Data)
-					}
-				}
+				pendingProposals = append(pendingProposals, bn.onCommitQuorum(key)...)
 			}
 		}
 
@@ -405,11 +435,7 @@ func (bn *BFTNode) Step(ctx context.Context, m *pb.Message) error {
 			bn.broadcast(cMsg)
 
 			if uint64(len(bn.commits[key])) >= (2*bn.f + 1) {
-				if entries, ok := bn.reqs[key]; ok {
-					for _, ent := range entries {
-						pendingProposals = append(pendingProposals, ent.Data)
-					}
-				}
+				pendingProposals = append(pendingProposals, bn.onCommitQuorum(key)...)
 			}
 		}
 
@@ -423,11 +449,7 @@ func (bn *BFTNode) Step(ctx context.Context, m *pb.Message) error {
 		isAbove := uint64(len(bn.commits[key])) >= (2*bn.f + 1)
 
 		if wasBelow && isAbove {
-			if entries, ok := bn.reqs[key]; ok {
-				for _, ent := range entries {
-					pendingProposals = append(pendingProposals, ent.Data)
-				}
-			}
+			pendingProposals = append(pendingProposals, bn.onCommitQuorum(key)...)
 		}
 	}
 
@@ -520,6 +542,181 @@ func (bn *BFTNode) ConstructC(bctx BFTContext) (*pb.Message, error) {
 		return nil, err
 	}
 	return &pb.Message{Type: pb.MsgApp.Enum(), From: new(uint64(bn.selfID)), Context: encCtx}, nil
+}
+
+func (bn *BFTNode) ConstructCheckpoint(seq uint64, digest [32]byte) (*pb.Message, error) {
+	bctx := BFTContext{
+		Phase:            PhaseCheckpoint,
+		View:             bn.view,
+		SeqNum:           seq,
+		Digest:           digest,
+		CheckpointSeqNum: seq,
+		CheckpointDigest: digest,
+	}
+
+	encCtx, err := encodeBFTContext(bctx)
+	if err != nil {
+		return nil, err
+	}
+
+	return &pb.Message{
+		Type:    pb.MsgApp.Enum(),
+		From:    new(uint64(bn.selfID)),
+		Context: encCtx,
+	}, nil
+}
+
+func (bn *BFTNode) onCommitQuorum(key bftSeqKey) [][]byte {
+	var data [][]byte
+	if entries, ok := bn.reqs[key]; ok {
+		for _, ent := range entries {
+			data = append(data, ent.Data)
+		}
+	}
+	bn.constructCheckpointIfNeeded(key.seq)
+	return data
+}
+
+func (bn *BFTNode) stateDigestAt(seq uint64) [32]byte {
+	var buf []byte
+	for s := uint64(1); s <= seq; s++ {
+		k := bftSeqKey{view: bn.view, seq: s}
+		if d, ok := bn.pp[k]; ok {
+			buf = append(buf, d[:]...)
+		}
+	}
+	return hashData(buf)
+}
+
+func (bn *BFTNode) hasExecutedThrough(seq uint64) bool {
+	for s := uint64(1); s <= seq; s++ {
+		if _, ok := bn.pp[bftSeqKey{view: bn.view, seq: s}]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func (bn *BFTNode) localCheckpointDigest(seq uint64) ([32]byte, bool) {
+	if !bn.hasExecutedThrough(seq) {
+		return [32]byte{}, false
+	}
+	return bn.stateDigestAt(seq), true
+}
+
+func (bn *BFTNode) recordCheckpoint(seq uint64, dig [32]byte, replica uint64) {
+	if bn.checkpoints[seq] == nil {
+		bn.checkpoints[seq] = make(map[[32]byte]map[uint64]*Checkpoint)
+	}
+	if bn.checkpoints[seq][dig] == nil {
+		bn.checkpoints[seq][dig] = make(map[uint64]*Checkpoint)
+	}
+	bn.checkpoints[seq][dig][replica] = &Checkpoint{
+		SeqNum:  seq,
+		Digest:  dig,
+		Replica: replica,
+	}
+}
+
+// acceptCheckpoint records a peer checkpoint only if this replica has executed
+// through seq and agrees on the state digest. Stabilization requires 2f+1 such
+// proofs (at least f+1 non-faulty replicas in the f < n/3 model).
+func (bn *BFTNode) acceptCheckpoint(seq uint64, dig [32]byte, replica uint64) {
+	localDig, ok := bn.localCheckpointDigest(seq)
+	if !ok || localDig != dig {
+		return
+	}
+	bn.recordCheckpoint(seq, dig, replica)
+	if uint64(len(bn.checkpoints[seq][dig])) >= 2*bn.f+1 {
+		bn.stabilizeCheckpoint(seq, dig)
+	}
+}
+
+// constructCheckpointIfNeeded creates and multicasts a CHECKPOINT after executing
+// seq when seq is a multiple of CheckpointInterval.
+func (bn *BFTNode) constructCheckpointIfNeeded(seq uint64) {
+	if seq == 0 || seq%CheckpointInterval != 0 {
+		return
+	}
+	if bn.stableCheckpoint != nil && seq <= bn.stableCheckpoint.SeqNum {
+		return
+	}
+
+	dig, ok := bn.localCheckpointDigest(seq)
+	if !ok {
+		return
+	}
+
+	bn.recordCheckpoint(seq, dig, bn.selfID)
+
+	cpMsg, err := bn.ConstructCheckpoint(seq, dig)
+	if err != nil {
+		return
+	}
+	bn.broadcast(cpMsg)
+
+	if uint64(len(bn.checkpoints[seq][dig])) >= 2*bn.f+1 {
+		bn.stabilizeCheckpoint(seq, dig)
+	}
+}
+
+func (bn *BFTNode) stabilizeCheckpoint(seq uint64, dig [32]byte) {
+	localDig, ok := bn.localCheckpointDigest(seq)
+	if !ok || localDig != dig {
+		return
+	}
+	if bn.stableCheckpoint != nil && seq <= bn.stableCheckpoint.SeqNum {
+		return
+	}
+
+	proofs := make([]BFTCheckpointProof, 0, len(bn.checkpoints[seq][dig]))
+	for replica := range bn.checkpoints[seq][dig] {
+		proofs = append(proofs, BFTCheckpointProof{
+			ReplicaID: replica,
+			SeqNum:    seq,
+			Digest:    dig,
+		})
+	}
+
+	bn.stableCheckpoint = &StableCheckpoint{
+		SeqNum: seq,
+		Digest: dig,
+		Proofs: proofs,
+	}
+
+	bn.lowW = seq
+	bn.highW = seq + WatermarkWindow
+	bn.garbageCollect(seq)
+}
+
+// StableCheckpoint returns a copy of the latest stable checkpoint certificate,
+// including 2f+1 proofs usable for view-change / state transfer to lagging replicas.
+func (bn *BFTNode) StableCheckpoint() *StableCheckpoint {
+	bn.mu.Lock()
+	defer bn.mu.Unlock()
+	if bn.stableCheckpoint == nil {
+		return nil
+	}
+	sc := *bn.stableCheckpoint
+	sc.Proofs = append([]BFTCheckpointProof(nil), bn.stableCheckpoint.Proofs...)
+	return &sc
+}
+
+// garbageCollect discards request state at or below a stable checkpoint sequence.
+func (bn *BFTNode) garbageCollect(seq uint64) {
+	for key := range bn.pp {
+		if key.seq <= seq {
+			delete(bn.pp, key)
+			delete(bn.prepares, key)
+			delete(bn.commits, key)
+			delete(bn.reqs, key)
+		}
+	}
+	for cpSeq := range bn.checkpoints {
+		if cpSeq < seq {
+			delete(bn.checkpoints, cpSeq)
+		}
+	}
 }
 
 func (bn *BFTNode) broadcast(m *pb.Message) {

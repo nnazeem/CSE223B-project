@@ -225,7 +225,7 @@ func (b *BFTMessageBuilder) ConstructViewChange(
 	to uint64,
 	view uint64,
 	lastStableSeq uint64,
-	checkpointProofs []BFTPreparedProof,
+	checkpointProofs []BFTCheckpointProof,
 	preparedProofs []BFTPreparedProof,
 ) (pb.Message, int64, error) {
 	bctx := BFTContext{
@@ -233,7 +233,7 @@ func (b *BFTMessageBuilder) ConstructViewChange(
 		View:             view,
 		CheckpointSeqNum: lastStableSeq,
 		SeqNum:           lastStableSeq,
-		CheckpointProofs: append([]BFTPreparedProof(nil), checkpointProofs...),
+		CheckpointProofs: append([]BFTCheckpointProof(nil), checkpointProofs...),
 		PreparedProofs:   append([]BFTPreparedProof(nil), preparedProofs...),
 	}
 

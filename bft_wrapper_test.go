@@ -528,14 +528,13 @@ func TestBFT_Integration_RealRaftNetwork(t *testing.T) {
 		}
 	}()
 
-	var leaderID uint64
 WaitLeader:
 	for {
 		for _, bn := range nodes {
 			bn.Tick()
 		}
 		select {
-		case leaderID = <-leaderChan:
+		case <-leaderChan:
 			break WaitLeader
 		case <-time.After(10 * time.Millisecond):
 		}
@@ -549,7 +548,8 @@ WaitLeader:
 
 	clientMsg := <-bftClient.Ready()
 
-	err = nodes[leaderID].Step(ctx, clientMsg)
+	// Route to the PBFT primary (view 0 -> node 1), not the Raft leader.
+	err = nodes[1].Step(ctx, clientMsg)
 	require.NoError(t, err)
 
 	select {
