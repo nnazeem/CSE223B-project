@@ -33,18 +33,11 @@ import (
 // 	Result []byte // For PhaseReply
 // }
 
-type Checkpoint struct {
-	SeqNum  uint64
-	Digest  [32]byte
-	Replica uint64
-	Sig     []byte
-}
-
 type StableCheckpoint struct {
 	SeqNum uint64
 	Digest [32]byte
 
-	Proofs []BFTCheckpointProof // proofs of the stable checkpoint, should be 2f+1
+	Proof BFTCheckpointProof // proofs of the stable checkpoint, should be 2f+1
 }
 
 type bftSeqKey struct {
@@ -153,13 +146,26 @@ type BFTNode struct {
 	clientPub   ed25519.PublicKey
 	priv        ed25519.PrivateKey
 
-	view uint64
-	log  []*pb.Entry
+	bftMessageBuilder *BFTMessageBuilder
+
+	nodePhase BFTNodePhase
+	view      uint64
+	log       map[uint64]*pb.Message
 
 	pp       map[bftSeqKey][32]byte
-	prepares map[bftSeqKey]map[uint64]struct{}
+	prepares map[bftSeqKey]map[uint64]*pb.Message
 	commits  map[bftSeqKey]map[uint64]struct{}
-	reqs     map[bftSeqKey][]*pb.Entry // Buffer to hold full payloads during PBFT consensus
+	reqs     map[bftSeqKey]*pb.Message // Buffer to hold full payloads during PBFT consensus
+
+	requestTS     map[bftSeqKey]int64
+	requestClient map[bftSeqKey]uint64
+
+	timer         *PendingTimer
+	pending       []uint64
+	vc            map[uint64]map[uint64]*pb.Message
+	vc_timer      *PendingTimer
+	campaign_view uint64
+	last_replied  uint64
 
 	lowW     uint64
 	highW    uint64
@@ -175,7 +181,7 @@ type BFTNode struct {
 	triggerc chan struct{}
 	advancec chan struct{}
 
-	checkpoints map[uint64]map[[32]byte]map[uint64]*Checkpoint
+	checkpoints map[uint64]map[[32]byte]map[uint64]*pb.Message
 
 	stableCheckpoint *StableCheckpoint
 }
@@ -201,10 +207,22 @@ func WrapBFTNode(
 		clientPub:   clientPub,
 		cfg:         c,
 
-		pp:       make(map[bftSeqKey][32]byte),
-		prepares: make(map[bftSeqKey]map[uint64]struct{}),
-		commits:  make(map[bftSeqKey]map[uint64]struct{}),
-		reqs:     make(map[bftSeqKey][]*pb.Entry),
+		bftMessageBuilder: NewBFTMessageBuilder(selfID, priv, &c),
+
+		pp:            make(map[bftSeqKey][32]byte),
+		prepares:      make(map[bftSeqKey]map[uint64]*pb.Message),
+		commits:       make(map[bftSeqKey]map[uint64]struct{}),
+		reqs:          make(map[bftSeqKey]*pb.Message),
+		requestTS:     make(map[bftSeqKey]int64),
+		requestClient: make(map[bftSeqKey]uint64),
+
+		pending:       make([]uint64, 0),
+		timer:         NewPendingTimer(100),
+		nodePhase:     Normal,
+		log:           make(map[uint64]*pb.Message),
+		vc:            make(map[uint64]map[uint64]*pb.Message),
+		vc_timer:      NewPendingTimer(30 / 2),
+		campaign_view: 0,
 
 		lowW:     0,
 		highW:    WatermarkWindow,
@@ -216,7 +234,7 @@ func WrapBFTNode(
 		triggerc:   make(chan struct{}, 1),
 		advancec:   make(chan struct{}),
 
-		checkpoints: make(map[uint64]map[[32]byte]map[uint64]*Checkpoint),
+		checkpoints:      make(map[uint64]map[[32]byte]map[uint64]*pb.Message),
 		stableCheckpoint: nil,
 	}
 
@@ -226,13 +244,27 @@ func WrapBFTNode(
 
 func (bn *BFTNode) signOutboundMessages(msgs []*pb.Message) {
 	for i := range msgs {
+		if msgs[i] == nil {
+			continue
+		}
+
+		// Forwarded client requests must preserve the client's signature.
+		// A backup may change To to point at the primary, but it must not
+		// replace the client signature with the replica signature.
+		if bn.isClientRequest(msgs[i]) {
+			continue
+		}
+
 		ts := bn.cfg.now().UnixNano()
 		origCtx := normalizeContext(msgs[i].Context)
+
 		dataSign, err := messageSignBytes(msgs[i], origCtx, ts)
-		if err == nil {
-			sig := ed25519.Sign(bn.priv, dataSign)
-			msgs[i].Context = packSignature(sig, ts, origCtx)
+		if err != nil {
+			continue
 		}
+
+		sig := ed25519.Sign(bn.priv, dataSign)
+		msgs[i].Context = packSignature(sig, ts, origCtx)
 	}
 }
 
@@ -280,7 +312,275 @@ func (bn *BFTNode) Advance() {
 	bn.advancec <- struct{}{}
 }
 
-func (bn *BFTNode) Tick() { bn.Node.Tick() }
+func (bn *BFTNode) TriggerViewChange(newView uint64) error {
+	bn.nodePhase = ViewChange
+	bn.pending = make([]uint64, 0)
+	bn.timer.Stop()
+
+	vc, err := bn.ConstructViewChange(newView)
+	if err != nil {
+		return err
+	}
+
+	vcEvidence, err := bn.signEvidence(vc)
+	if err != nil {
+		return err
+	}
+
+	if bn.vc[newView] == nil {
+		bn.vc[newView] = make(map[uint64]*pb.Message)
+	}
+	bn.vc[newView][bn.selfID] = vcEvidence
+
+	bn.campaign_view = newView
+	bn.vc_timer.StartExp()
+
+	bn.broadcast(vc)
+	return nil
+}
+
+func (bn *BFTNode) ConstructViewChange(newView uint64) (*pb.Message, error) {
+	lastStableSeq := uint64(0)
+	checkpointProof := BFTCheckpointProof{}
+
+	if bn.stableCheckpoint != nil {
+		lastStableSeq = bn.stableCheckpoint.SeqNum
+		checkpointProof = bn.stableCheckpoint.Proof
+	}
+
+	var preparedProofs []BFTPreparedProof
+	for key := range bn.pp {
+		if key.seq <= lastStableSeq {
+			continue
+		}
+
+		pKey := bftSeqKey{view: key.view, seq: key.seq}
+		if uint64(len(bn.prepares[pKey])) >= 2*bn.f {
+			preparedProofs = append(preparedProofs, BFTPreparedProof{
+				View:     pKey.view,
+				SeqNum:   pKey.seq,
+				Digest:   bn.pp[pKey],
+				Prepares: MapValues(bn.prepares[pKey]),
+			})
+		}
+	}
+
+	bctx := BFTContext{
+		Phase:            PhaseViewChange,
+		View:             newView,
+		SeqNum:           lastStableSeq,
+		CheckpointSeqNum: lastStableSeq,
+		CheckpointDigest: checkpointProof.Digest,
+		CheckpointProofs: checkpointProof,
+		PreparedProofs:   preparedProofs,
+	}
+
+	encCtx, err := encodeBFTContext(bctx)
+	if err != nil {
+		return nil, err
+	}
+
+	return &pb.Message{
+		Type:    pb.MsgApp.Enum(),
+		From:    u64p(bn.selfID),
+		Context: encCtx,
+	}, nil
+}
+
+func (bn *BFTNode) notifyReadyIfNeeded() {
+	bn.mu.Lock()
+	hasMsgs := len(bn.bftMsgs) > 0
+	bn.mu.Unlock()
+
+	if hasMsgs {
+		select {
+		case bn.triggerc <- struct{}{}:
+		default:
+		}
+	}
+}
+
+func (bn *BFTNode) TriggerNewView(view uint64) error {
+	nv, err := bn.ConstructNewView(view)
+	if err != nil {
+		return err
+	}
+
+	bctx, err := decodeBFTContext(nv.Context)
+	if err != nil {
+		return err
+	}
+
+	if err := bn.installNewView(bctx); err != nil {
+		return err
+	}
+
+	bn.broadcast(nv)
+	return nil
+}
+
+func (bn *BFTNode) ConstructNewView(view uint64) (*pb.Message, error) {
+	vcs := bn.vc[view]
+	if uint64(len(vcs)) < 2*bn.f+1 {
+		return nil, errors.New("insufficient view-change quorum")
+	}
+
+	viewSet := make([]pb.Message, 0, len(vcs))
+	for _, vc := range vcs {
+		if vc != nil {
+			viewSet = append(viewSet, *proto.Clone(vc).(*pb.Message))
+		}
+	}
+
+	if uint64(len(viewSet)) < 2*bn.f+1 {
+		return nil, errors.New("insufficient non-nil view-change quorum")
+	}
+
+	prePrepareSet, err := bn.computeNewViewPrePrepareSet(view, vcs)
+	if err != nil {
+		return nil, err
+	}
+
+	bctx := BFTContext{
+		Phase:         PhaseNewView,
+		View:          view,
+		ViewSet:       viewSet,
+		PrePrepareSet: prePrepareSet,
+	}
+
+	encCtx, err := encodeBFTContext(bctx)
+	if err != nil {
+		return nil, err
+	}
+
+	return &pb.Message{
+		Type:    pb.MsgApp.Enum(),
+		From:    u64p(bn.selfID),
+		Context: encCtx,
+	}, nil
+}
+
+func (bn *BFTNode) computeNewViewPrePrepareSet(
+	newView uint64,
+	vcs map[uint64]*pb.Message,
+) ([]pb.Message, error) {
+	type selected struct {
+		preparedView     uint64
+		seq              uint64
+		digest           [32]byte
+		entries          []*pb.Entry
+		requestTimestamp int64
+		clientID         uint64
+		clientRequest    pb.Message
+	}
+
+	selectedBySeq := make(map[uint64]selected)
+
+	for replica, signedVC := range vcs {
+		pub, ok := bn.nodePubKeys[replica]
+		if !ok {
+			return nil, ErrUnknownSigner
+		}
+
+		_, origCtx, err := VerifyBFTMessageSignature(signedVC, pub)
+		if err != nil {
+			return nil, err
+		}
+
+		vcCtx, err := decodeBFTContext(origCtx)
+		if err != nil {
+			return nil, err
+		}
+
+		for _, proof := range vcCtx.PreparedProofs {
+			if proof.SeqNum <= vcCtx.CheckpointSeqNum {
+				continue
+			}
+
+			entries, requestTS, clientID, clientReq, ok := extractPreparedPrePrepare(proof)
+			if !ok {
+				return nil, ErrInvalidPreparedProof
+			}
+
+			cur, exists := selectedBySeq[proof.SeqNum]
+			if !exists || proof.View > cur.preparedView {
+				selectedBySeq[proof.SeqNum] = selected{
+					preparedView:     proof.View,
+					seq:              proof.SeqNum,
+					digest:           proof.Digest,
+					entries:          entries,
+					requestTimestamp: requestTS,
+					clientID:         clientID,
+					clientRequest:    clientReq,
+				}
+			}
+		}
+	}
+
+	out := make([]pb.Message, 0, len(selectedBySeq))
+	for _, sel := range selectedBySeq {
+		bctx := BFTContext{
+			Phase:            PhasePrePrepare,
+			View:             newView,
+			SeqNum:           sel.seq,
+			Digest:           sel.digest,
+			RequestTimestamp: sel.requestTimestamp,
+			ClientID:         sel.clientID,
+			ClientRequest:    sel.clientRequest,
+		}
+		encCtx, err := encodeBFTContext(bctx)
+		if err != nil {
+			return nil, err
+		}
+
+		pp := &pb.Message{
+			Type:    pb.MsgApp.Enum(),
+			From:    u64p(bn.primaryForView(newView)),
+			Context: encCtx,
+			Entries: cloneEntries(sel.entries),
+		}
+
+		signedPP, err := bn.signEvidence(pp)
+		if err != nil {
+			return nil, err
+		}
+
+		out = append(out, *signedPP)
+	}
+
+	return out, nil
+}
+
+func (bn *BFTNode) Tick() {
+	// println("bft: tick")
+	bn.Node.Tick()
+	bn.mu.Lock()
+	expired := false
+	if bn.nodePhase == Normal {
+		expired = bn.timer.Tick()
+		if expired {
+			err := bn.TriggerViewChange(bn.view + 1)
+			if err != nil {
+				println("error triggering view change")
+			}
+			//println("bft: view change triggered")
+		}
+	} else {
+		expired = bn.vc_timer.Tick()
+		if expired {
+			err := bn.TriggerViewChange(bn.campaign_view + 1)
+			if err != nil {
+				println("error triggering view change after expiry")
+			}
+			//println("bft: triggered view change after expiry")
+		}
+	}
+	bn.mu.Unlock()
+
+	if expired {
+		bn.notifyReadyIfNeeded()
+	}
+}
 
 func (bn *BFTNode) Propose(ctx context.Context, data []byte) error {
 	return errors.New("bft: nodes must propose via BFTClient")
@@ -291,54 +591,72 @@ func (bn *BFTNode) Step(ctx context.Context, m *pb.Message) error {
 		return errors.New("cannot step with nil message")
 	}
 
-	defer func() {
-		bn.mu.Lock()
-		hasMsgs := len(bn.bftMsgs) > 0
-		bn.mu.Unlock()
-		if hasMsgs {
-			select {
-			case bn.triggerc <- struct{}{}:
-			default:
-			}
-		}
-	}()
+	defer bn.notifyReadyIfNeeded()
 
 	if bn.isInternalMessage(m) {
 		return bn.Node.Step(ctx, m)
 	}
 
-	if err := bn.verifyMessage(m); err != nil {
-		return err
+	var clientReqTS int64
+
+	signedMsg := proto.Clone(m).(*pb.Message)
+
+	if bn.isClientRequest(m) {
+		ts, err := bn.VerifyClient(m)
+		if err != nil {
+			return err
+		}
+		clientReqTS = ts
+	} else {
+		if err := bn.verifyMessage(m); err != nil {
+			return err
+		}
 	}
 
 	var pendingProposals [][]byte
 
 	bn.mu.Lock()
+	if bn.nodePhase == Normal {
+		if bn.isClientRequest(m) {
+			//println("bft: client_request")
+			if bn.isLeader() {
+				bctx, ppMsg, err := bn.ConstructPP(m, signedMsg, clientReqTS)
+				if err != nil {
+					bn.mu.Unlock()
+					return err
+				}
 
-	if bn.isClientRequest(m) {
-		if bn.isLeader() {
-			bctx, ppMsg, err := bn.ConstructPP(m)
-			if err != nil {
-				bn.mu.Unlock()
-				return err
+				key := bftSeqKey{view: bctx.View, seq: bctx.SeqNum}
+				bn.requestTS[key] = bctx.RequestTimestamp
+				bn.requestClient[key] = bctx.ClientID
+				bn.pp[key] = bctx.Digest
+				if !containsSeq(bn.pending, key.seq) {
+					bn.pending = append(bn.pending, key.seq)
+				}
+				bn.timer.Start()
+
+				bn.reqs[key] = m
+
+				if bn.prepares[key] == nil {
+					bn.prepares[key] = make(map[uint64]*pb.Message)
+				}
+
+				ppEvidence, err := bn.signEvidence(ppMsg)
+				if err != nil {
+					bn.mu.Unlock()
+					return err
+				}
+				bn.prepares[key][bn.selfID] = ppEvidence
+
+				bn.broadcast(ppMsg)
+			} else {
+				forward := proto.Clone(signedMsg).(*pb.Message)
+				forward.To = u64p(bn.primaryForView(bn.view))
+				bn.bftMsgs = append(bn.bftMsgs, forward)
 			}
-
-			key := bftSeqKey{view: bctx.View, seq: bctx.SeqNum}
-			bn.pp[key] = bctx.Digest
-
-			if len(m.Entries) > 0 {
-				bn.reqs[key] = m.Entries
-			}
-
-			if bn.prepares[key] == nil {
-				bn.prepares[key] = make(map[uint64]struct{})
-			}
-			bn.prepares[key][bn.selfID] = struct{}{}
-
-			bn.broadcast(ppMsg)
+			bn.mu.Unlock()
+			return nil
 		}
-		bn.mu.Unlock()
-		return nil
 	}
 
 	bctx, err := decodeBFTContext(m.Context)
@@ -352,104 +670,179 @@ func (bn *BFTNode) Step(ctx context.Context, m *pb.Message) error {
 
 	switch bctx.Phase {
 	case PhaseCheckpoint:
+		//println("bft: checkpoint")
 		seq := bctx.CheckpointSeqNum
 		dig := bctx.CheckpointDigest
-		bn.acceptCheckpoint(seq, dig, m.GetFrom())
+		bn.acceptCheckpoint(seq, dig, m.GetFrom(), signedMsg)
 		bn.mu.Unlock()
 		return nil
-	case PhasePrePrepare:
-		if bctx.View != bn.view {
-			bn.mu.Unlock()
-			return errors.New("view mismatch")
+	case PhaseViewChange:
+		if bn.vc[bctx.View] == nil {
+			bn.vc[bctx.View] = make(map[uint64]*pb.Message)
 		}
-		if bctx.SeqNum <= bn.lowW || bctx.SeqNum > bn.highW {
-			bn.mu.Unlock()
-			return errors.New("sequence number out of bounds")
-		}
-		if existing, exists := bn.pp[key]; exists && existing != bctx.Digest {
-			bn.mu.Unlock()
-			return errors.New("conflicting pre-prepare digest")
+		bn.vc[bctx.View][signedMsg.GetFrom()] = signedMsg
+
+		count, minView, ok := countMessagesAfterAndMinKey(bn.vc, bn.view)
+		if ok && uint64(count) >= bn.f+1 && bn.campaign_view < minView {
+			if err := bn.TriggerViewChange(minView); err != nil {
+				bn.mu.Unlock()
+				return err
+			}
 		}
 
-		bn.pp[key] = bctx.Digest
+		if uint64(len(bn.vc[bctx.View])) >= 2*bn.f+1 {
+			if bn.vc_timer.isOn() {
+				bn.vc_timer.StopAndResetBackoff()
+			}
 
-		if len(m.Entries) > 0 {
-			bn.reqs[key] = m.Entries
+			if bn.isPrimaryForView(bctx.View) {
+				if err := bn.TriggerNewView(bctx.View); err != nil {
+					bn.mu.Unlock()
+					return err
+				}
+			}
 		}
 
-		pMsg, err := bn.ConstructP(bctx)
-		if err != nil {
+		bn.mu.Unlock()
+		return nil
+	case PhaseNewView:
+		if err := bn.installNewView(bctx); err != nil {
 			bn.mu.Unlock()
 			return err
 		}
+		bn.mu.Unlock()
+		return nil
+	}
 
-		if bn.prepares[key] == nil {
-			bn.prepares[key] = make(map[uint64]struct{})
-		}
+	if bn.nodePhase == Normal {
+		switch bctx.Phase {
+		case PhasePrePrepare:
+			//println("bft: pp")
+			if bctx.View != bn.view {
+				bn.mu.Unlock()
+				return errors.New("view mismatch")
+			}
+			// this means only message completes at a time
+			// (bctx.SeqNum > bn.last_replied+1)
+			if bctx.SeqNum <= bn.lowW || bctx.SeqNum > bn.highW {
+				bn.mu.Unlock()
+				return errors.New("sequence number out of bounds")
+			}
+			if existing, exists := bn.pp[key]; exists && existing != bctx.Digest {
+				bn.mu.Unlock()
+				return errors.New("conflicting pre-prepare digest")
+			}
 
-		bn.prepares[key][m.GetFrom()] = struct{}{}
-		wasBelow := uint64(len(bn.prepares[key])) < (2*bn.f + 1)
-		bn.prepares[key][bn.selfID] = struct{}{} // Self-vote
-		isAbove := uint64(len(bn.prepares[key])) >= (2*bn.f + 1)
+			bn.pp[key] = bctx.Digest
+			bn.requestTS[key] = bctx.RequestTimestamp
+			bn.requestClient[key] = bctx.ClientID
+			if !containsSeq(bn.pending, key.seq) {
+				bn.pending = append(bn.pending, key.seq)
+			}
+			bn.timer.Start()
 
-		bn.broadcast(pMsg)
+			bn.reqs[key] = m
 
-		if wasBelow && isAbove {
-			cMsg, err := bn.ConstructC(bctx)
+			pMsg, err := bn.ConstructP(bctx)
 			if err != nil {
 				bn.mu.Unlock()
 				return err
 			}
 
-			if bn.commits[key] == nil {
-				bn.commits[key] = make(map[uint64]struct{})
+			if bn.prepares[key] == nil {
+				bn.prepares[key] = make(map[uint64]*pb.Message)
 			}
-			bn.commits[key][bn.selfID] = struct{}{}
-			bn.broadcast(cMsg)
 
-			if uint64(len(bn.commits[key])) >= (2*bn.f + 1) {
-				pendingProposals = append(pendingProposals, bn.onCommitQuorum(key)...)
-			}
-		}
-
-	case PhasePrepare:
-		if bn.prepares[key] == nil {
-			bn.prepares[key] = make(map[uint64]struct{})
-		}
-
-		wasBelow := uint64(len(bn.prepares[key])) < (2*bn.f + 1)
-		bn.prepares[key][m.GetFrom()] = struct{}{}
-		isAbove := uint64(len(bn.prepares[key])) >= (2*bn.f + 1)
-
-		if wasBelow && isAbove {
-			cMsg, err := bn.ConstructC(bctx)
+			bn.prepares[key][m.GetFrom()] = signedMsg
+			wasBelow := uint64(len(bn.prepares[key])) < (2*bn.f + 1)
+			pEvidence, err := bn.signEvidence(pMsg)
 			if err != nil {
 				bn.mu.Unlock()
 				return err
 			}
+			bn.prepares[key][bn.selfID] = pEvidence
+			isAbove := uint64(len(bn.prepares[key])) >= (2*bn.f + 1)
+
+			bn.broadcast(pMsg)
+
+			if wasBelow && isAbove {
+				cMsg, err := bn.ConstructC(bctx)
+				if err != nil {
+					bn.mu.Unlock()
+					return err
+				}
+
+				if bn.commits[key] == nil {
+					bn.commits[key] = make(map[uint64]struct{})
+				}
+				bn.commits[key][bn.selfID] = struct{}{}
+				bn.broadcast(cMsg)
+
+				if uint64(len(bn.commits[key])) >= (2*bn.f + 1) {
+					pendingProposals = append(pendingProposals, bn.onCommitQuorum(key)...)
+				}
+			}
+
+		case PhasePrepare:
+			//println("bft: ch")
+			if !bn.acceptedDigestMatches(key, bctx.Digest) {
+				bn.mu.Unlock()
+				return errors.New("raft: prepare does not match accepted pre-prepare")
+			}
+			if m.GetFrom() == bn.primaryForView(bctx.View) {
+				bn.mu.Unlock()
+				return errors.New("raft: primary must not send prepare")
+			}
+
+			if bn.prepares[key] == nil {
+				bn.prepares[key] = make(map[uint64]*pb.Message)
+			}
+
+			wasBelow := uint64(len(bn.prepares[key])) < (2*bn.f + 1)
+			bn.prepares[key][m.GetFrom()] = signedMsg
+			isAbove := uint64(len(bn.prepares[key])) >= (2*bn.f + 1)
+
+			if wasBelow && isAbove {
+				cMsg, err := bn.ConstructC(bctx)
+				if err != nil {
+					bn.mu.Unlock()
+					return err
+				}
+
+				if bn.commits[key] == nil {
+					bn.commits[key] = make(map[uint64]struct{})
+				}
+				bn.commits[key][bn.selfID] = struct{}{}
+				bn.broadcast(cMsg)
+
+				if uint64(len(bn.commits[key])) >= (2*bn.f + 1) {
+					pendingProposals = append(pendingProposals, bn.onCommitQuorum(key)...)
+				}
+			}
+
+		case PhaseCommit:
+			//println("bft: commit")
+			if !bn.acceptedDigestMatches(key, bctx.Digest) {
+				bn.mu.Unlock()
+				return errors.New("raft: commit does not match accepted pre-prepare")
+			}
+			if uint64(len(bn.prepares[key])) < 2*bn.f+1 {
+				bn.mu.Unlock()
+				return errors.New("raft: commit before prepared certificate")
+			}
 
 			if bn.commits[key] == nil {
 				bn.commits[key] = make(map[uint64]struct{})
 			}
-			bn.commits[key][bn.selfID] = struct{}{}
-			bn.broadcast(cMsg)
 
-			if uint64(len(bn.commits[key])) >= (2*bn.f + 1) {
+			wasBelow := uint64(len(bn.commits[key])) < (2*bn.f + 1)
+			bn.commits[key][m.GetFrom()] = struct{}{}
+			isAbove := uint64(len(bn.commits[key])) >= (2*bn.f + 1)
+
+			if wasBelow && isAbove {
 				pendingProposals = append(pendingProposals, bn.onCommitQuorum(key)...)
 			}
-		}
-
-	case PhaseCommit:
-		if bn.commits[key] == nil {
-			bn.commits[key] = make(map[uint64]struct{})
-		}
-
-		wasBelow := uint64(len(bn.commits[key])) < (2*bn.f + 1)
-		bn.commits[key][m.GetFrom()] = struct{}{}
-		isAbove := uint64(len(bn.commits[key])) >= (2*bn.f + 1)
-
-		if wasBelow && isAbove {
-			pendingProposals = append(pendingProposals, bn.onCommitQuorum(key)...)
+			//println("bft: commit done")
 		}
 	}
 
@@ -465,8 +858,13 @@ func (bn *BFTNode) Step(ctx context.Context, m *pb.Message) error {
 }
 
 func (bn *BFTNode) verifyMessage(m *pb.Message) error {
+	if m == nil {
+		return ErrInvalidBFTMessage
+	}
+
 	if bn.isClientRequest(m) {
-		return bn.VerifyClient(m)
+		_, err := bn.VerifyClient(m)
+		return err
 	}
 
 	pubKey, ok := bn.nodePubKeys[m.GetFrom()]
@@ -478,41 +876,71 @@ func (bn *BFTNode) verifyMessage(m *pb.Message) error {
 	if err != nil {
 		return err
 	}
+
+	bctx, decodeErr := decodeBFTContext(origCtx)
+	if decodeErr == nil && bctx.Phase.IsBFTMessagePhase() {
+		if err := bn.validateBFTMessage(m, bctx); err != nil {
+			return err
+		}
+	}
+
+	// Preserve existing tunnel behavior: signed non-BFT raft traffic is allowed
+	// through after signature verification.
 	m.Context = origCtx
 	return nil
 }
 
-func (bn *BFTNode) VerifyClient(m *pb.Message) error {
+func (bn *BFTNode) VerifyClient(m *pb.Message) (int64, error) {
 	if _, ok := bn.clientIDs[m.GetFrom()]; !ok {
-		return ErrUnknownSigner
+		return 0, ErrUnknownSigner
 	}
 
 	ts, origCtx, err := VerifyBFTMessageSignature(m, bn.clientPub)
 	if err != nil {
-		return err
+		return 0, err
 	}
 
 	bn.mu.Lock()
 	if last, ok := bn.clientSeen[m.GetFrom()]; ok && ts <= last {
 		bn.mu.Unlock()
-		return ErrStaleMessage
+		return 0, ErrStaleMessage
 	}
 	bn.clientSeen[m.GetFrom()] = ts
 	bn.mu.Unlock()
 
 	m.Context = origCtx
-	return nil
+	return ts, nil
 }
 
-func (bn *BFTNode) ConstructPP(m *pb.Message) (BFTContext, *pb.Message, error) {
+func (bn *BFTNode) ConstructPP(
+	m *pb.Message,
+	signedClientReq *pb.Message,
+	requestTS int64,
+) (BFTContext, *pb.Message, error) {
 	seq := bn.nextSeqN
 	bn.nextSeqN++
 
-	var data []byte
-	if entries := m.GetEntries(); len(entries) > 0 && entries[0] != nil {
-		data = entries[0].Data
+	entries := cloneEntries(m.GetEntries())
+	digest, err := hashEntryBatch(entries)
+	if err != nil {
+		return BFTContext{}, nil, err
 	}
-	bctx := BFTContext{Phase: PhasePrePrepare, View: bn.view, SeqNum: seq, Digest: hashData(data)}
+
+	clientReqCopy := pb.Message{}
+	if signedClientReq != nil {
+		clientReqCopy = *proto.Clone(signedClientReq).(*pb.Message)
+	}
+
+	bctx := BFTContext{
+		Phase:            PhasePrePrepare,
+		View:             bn.view,
+		SeqNum:           seq,
+		Digest:           digest,
+		RequestTimestamp: requestTS,
+		ClientID:         m.GetFrom(),
+		ClientRequest:    clientReqCopy,
+	}
+
 	encCtx, err := encodeBFTContext(bctx)
 	if err != nil {
 		return bctx, nil, err
@@ -520,9 +948,9 @@ func (bn *BFTNode) ConstructPP(m *pb.Message) (BFTContext, *pb.Message, error) {
 
 	return bctx, &pb.Message{
 		Type:    pb.MsgApp.Enum(),
-		From:    new(uint64(bn.selfID)),
+		From:    u64p(bn.selfID),
 		Context: encCtx,
-		Entries: m.Entries,
+		Entries: entries,
 	}, nil
 }
 
@@ -532,7 +960,7 @@ func (bn *BFTNode) ConstructP(bctx BFTContext) (*pb.Message, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &pb.Message{Type: pb.MsgApp.Enum(), From: new(uint64(bn.selfID)), Context: encCtx}, nil
+	return &pb.Message{Type: pb.MsgApp.Enum(), From: u64p(bn.selfID), Context: encCtx}, nil
 }
 
 func (bn *BFTNode) ConstructC(bctx BFTContext) (*pb.Message, error) {
@@ -541,7 +969,7 @@ func (bn *BFTNode) ConstructC(bctx BFTContext) (*pb.Message, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &pb.Message{Type: pb.MsgApp.Enum(), From: new(uint64(bn.selfID)), Context: encCtx}, nil
+	return &pb.Message{Type: pb.MsgApp.Enum(), From: u64p(bn.selfID), Context: encCtx}, nil
 }
 
 func (bn *BFTNode) ConstructCheckpoint(seq uint64, digest [32]byte) (*pb.Message, error) {
@@ -561,36 +989,77 @@ func (bn *BFTNode) ConstructCheckpoint(seq uint64, digest [32]byte) (*pb.Message
 
 	return &pb.Message{
 		Type:    pb.MsgApp.Enum(),
-		From:    new(uint64(bn.selfID)),
+		From:    u64p(bn.selfID),
 		Context: encCtx,
 	}, nil
 }
 
 func (bn *BFTNode) onCommitQuorum(key bftSeqKey) [][]byte {
+	if req := bn.reqs[key]; req != nil {
+		bn.log[key.seq] = req
+	}
+
 	var data [][]byte
-	if entries, ok := bn.reqs[key]; ok {
-		for _, ent := range entries {
-			data = append(data, ent.Data)
+	if req := bn.reqs[key]; req != nil {
+		for _, ent := range req.GetEntries() {
+			if ent != nil {
+				data = append(data, append([]byte(nil), ent.Data...))
+			}
 		}
 	}
+
+	if bn.last_replied+1 == key.seq {
+		bn.last_replied = key.seq
+		reply, err := bn.ConstructReply(key, []byte("OK"))
+		if err == nil && reply != nil {
+			bn.bftMsgs = append(bn.bftMsgs, reply)
+		}
+
+		newPending := bn.pending[:0]
+		for _, seq := range bn.pending {
+			if seq != key.seq {
+				newPending = append(newPending, seq)
+			}
+		}
+		bn.pending = newPending
+
+		if len(bn.pending) == 0 {
+			bn.timer.Stop()
+		} else {
+			bn.timer.Reset()
+		}
+	}
+
 	bn.constructCheckpointIfNeeded(key.seq)
 	return data
 }
 
+func (bn *BFTNode) getLog() map[uint64]*pb.Message {
+	return bn.log
+}
+
 func (bn *BFTNode) stateDigestAt(seq uint64) [32]byte {
-	var buf []byte
+	var logAtSeq []*pb.Message
 	for s := uint64(1); s <= seq; s++ {
-		k := bftSeqKey{view: bn.view, seq: s}
-		if d, ok := bn.pp[k]; ok {
-			buf = append(buf, d[:]...)
-		}
+		logAtSeq = append(logAtSeq, bn.log[s])
+		// k := bftSeqKey{view: bn.view, seq: s}
+		// if d, ok := bn.pp[k]; ok {
+		// 	buf = append(buf, d[:]...)
+		// }
 	}
-	return hashData(buf)
+
+	h, err := hashMessageBatch(logAtSeq)
+
+	if err != nil {
+		println("stateDigestAt: hashing failed -- should not happen")
+	}
+
+	return h
 }
 
 func (bn *BFTNode) hasExecutedThrough(seq uint64) bool {
 	for s := uint64(1); s <= seq; s++ {
-		if _, ok := bn.pp[bftSeqKey{view: bn.view, seq: s}]; !ok {
+		if _, ok := bn.log[s]; !ok {
 			return false
 		}
 	}
@@ -601,32 +1070,29 @@ func (bn *BFTNode) localCheckpointDigest(seq uint64) ([32]byte, bool) {
 	if !bn.hasExecutedThrough(seq) {
 		return [32]byte{}, false
 	}
-	return bn.stateDigestAt(seq), true
+	digest := bn.stateDigestAt(seq)
+	return digest, true
 }
 
-func (bn *BFTNode) recordCheckpoint(seq uint64, dig [32]byte, replica uint64) {
+func (bn *BFTNode) recordCheckpoint(seq uint64, dig [32]byte, replica uint64, msg *pb.Message) {
 	if bn.checkpoints[seq] == nil {
-		bn.checkpoints[seq] = make(map[[32]byte]map[uint64]*Checkpoint)
+		bn.checkpoints[seq] = make(map[[32]byte]map[uint64]*pb.Message)
 	}
 	if bn.checkpoints[seq][dig] == nil {
-		bn.checkpoints[seq][dig] = make(map[uint64]*Checkpoint)
+		bn.checkpoints[seq][dig] = make(map[uint64]*pb.Message)
 	}
-	bn.checkpoints[seq][dig][replica] = &Checkpoint{
-		SeqNum:  seq,
-		Digest:  dig,
-		Replica: replica,
-	}
+	bn.checkpoints[seq][dig][replica] = msg
 }
 
 // acceptCheckpoint records a peer checkpoint only if this replica has executed
 // through seq and agrees on the state digest. Stabilization requires 2f+1 such
 // proofs (at least f+1 non-faulty replicas in the f < n/3 model).
-func (bn *BFTNode) acceptCheckpoint(seq uint64, dig [32]byte, replica uint64) {
+func (bn *BFTNode) acceptCheckpoint(seq uint64, dig [32]byte, replica uint64, msg *pb.Message) {
 	localDig, ok := bn.localCheckpointDigest(seq)
 	if !ok || localDig != dig {
 		return
 	}
-	bn.recordCheckpoint(seq, dig, replica)
+	bn.recordCheckpoint(seq, dig, replica, msg)
 	if uint64(len(bn.checkpoints[seq][dig])) >= 2*bn.f+1 {
 		bn.stabilizeCheckpoint(seq, dig)
 	}
@@ -647,12 +1113,17 @@ func (bn *BFTNode) constructCheckpointIfNeeded(seq uint64) {
 		return
 	}
 
-	bn.recordCheckpoint(seq, dig, bn.selfID)
-
 	cpMsg, err := bn.ConstructCheckpoint(seq, dig)
 	if err != nil {
 		return
 	}
+
+	cpEvidence, err := bn.signEvidence(cpMsg)
+	if err != nil {
+		return
+	}
+
+	bn.recordCheckpoint(seq, dig, bn.selfID, cpEvidence)
 	bn.broadcast(cpMsg)
 
 	if uint64(len(bn.checkpoints[seq][dig])) >= 2*bn.f+1 {
@@ -669,19 +1140,21 @@ func (bn *BFTNode) stabilizeCheckpoint(seq uint64, dig [32]byte) {
 		return
 	}
 
-	proofs := make([]BFTCheckpointProof, 0, len(bn.checkpoints[seq][dig]))
-	for replica := range bn.checkpoints[seq][dig] {
-		proofs = append(proofs, BFTCheckpointProof{
-			ReplicaID: replica,
-			SeqNum:    seq,
-			Digest:    dig,
-		})
+	checkpoints := make([]pb.Message, 0, len(bn.checkpoints[seq][dig]))
+	for _, msg := range bn.checkpoints[seq][dig] {
+		if msg != nil {
+			checkpoints = append(checkpoints, *msg)
+		}
 	}
 
 	bn.stableCheckpoint = &StableCheckpoint{
 		SeqNum: seq,
 		Digest: dig,
-		Proofs: proofs,
+		Proof: BFTCheckpointProof{
+			SeqNum:      seq,
+			Digest:      dig,
+			Checkpoints: checkpoints,
+		},
 	}
 
 	bn.lowW = seq
@@ -694,11 +1167,13 @@ func (bn *BFTNode) stabilizeCheckpoint(seq uint64, dig [32]byte) {
 func (bn *BFTNode) StableCheckpoint() *StableCheckpoint {
 	bn.mu.Lock()
 	defer bn.mu.Unlock()
+
 	if bn.stableCheckpoint == nil {
 		return nil
 	}
+
 	sc := *bn.stableCheckpoint
-	sc.Proofs = append([]BFTCheckpointProof(nil), bn.stableCheckpoint.Proofs...)
+	sc.Proof.Checkpoints = append([]pb.Message(nil), bn.stableCheckpoint.Proof.Checkpoints...)
 	return &sc
 }
 
@@ -725,17 +1200,21 @@ func (bn *BFTNode) broadcast(m *pb.Message) {
 			continue
 		}
 		mCopy := proto.Clone(m).(*pb.Message)
-		mCopy.To = new(uint64(id))
+		mCopy.To = u64p(id)
 		bn.bftMsgs = append(bn.bftMsgs, mCopy)
 	}
 }
 
-func (bn *BFTNode) isLeader() bool { return (bn.view%bn.n)+1 == bn.selfID }
 func (bn *BFTNode) isInternalMessage(m *pb.Message) bool {
 	return IsLocalMsg(m.GetType()) || IsLocalMsgTarget(m.GetTo()) || IsLocalMsgTarget(m.GetFrom())
 }
+
 func (bn *BFTNode) isClientRequest(m *pb.Message) bool {
-	return m != nil && m.GetType() == pb.MsgProp
+	if m == nil || m.GetType() != pb.MsgProp {
+		return false
+	}
+	_, ok := bn.clientIDs[m.GetFrom()]
+	return ok
 }
 
 // ====================================================================
@@ -802,7 +1281,7 @@ func (c *BFTClient) Tick() {
 		if req.ticks > 10 {
 			for id := uint64(1); id <= c.n; id++ {
 				mCopy := proto.Clone(req.msg).(*pb.Message)
-				mCopy.To = new(uint64(id))
+				mCopy.To = u64p(id)
 
 				origCtx := normalizeContext(mCopy.Context)
 				dataSign, _ := messageSignBytes(mCopy, origCtx, ts)
@@ -830,7 +1309,7 @@ func (c *BFTClient) Propose(ctx context.Context, data []byte) error {
 
 	baseMsg := &pb.Message{
 		Type:    pb.MsgProp.Enum(),
-		From:    new(uint64(c.selfID)),
+		From:    u64p(c.selfID),
 		Entries: []*pb.Entry{{Data: data}},
 	}
 
@@ -840,7 +1319,7 @@ func (c *BFTClient) Propose(ctx context.Context, data []byte) error {
 
 	for id := uint64(1); id <= c.n; id++ {
 		mCopy := proto.Clone(baseMsg).(*pb.Message)
-		mCopy.To = new(uint64(id))
+		mCopy.To = u64p(id)
 
 		origCtx := normalizeContext(mCopy.Context)
 		dataSign, err := messageSignBytes(mCopy, origCtx, ts)
@@ -864,8 +1343,7 @@ func (c *BFTClient) Step(ctx context.Context, m *pb.Message) error {
 		return errors.New("nil message")
 	}
 
-	ts, err := c.verifyMessage(m)
-	if err != nil {
+	if err := c.verifyMessage(m); err != nil {
 		return err
 	}
 
@@ -874,25 +1352,33 @@ func (c *BFTClient) Step(ctx context.Context, m *pb.Message) error {
 		return errors.New("invalid reply message")
 	}
 
+	reqTS := bctx.RequestTimestamp
+	if reqTS == 0 {
+		return ErrInvalidBFTContext
+	}
+	if bctx.ClientID != c.selfID {
+		return ErrInvalidBFTContext
+	}
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if _, exists := c.pending[ts]; !exists {
+	if _, exists := c.pending[reqTS]; !exists {
 		return nil
 	}
 
-	if c.replies[ts] == nil {
-		c.replies[ts] = make(map[uint64][]byte)
+	if c.replies[reqTS] == nil {
+		c.replies[reqTS] = make(map[uint64][]byte)
 	}
-	c.replies[ts][m.GetFrom()] = bctx.Result
+	c.replies[reqTS][m.GetFrom()] = append([]byte(nil), bctx.Result...)
 
 	resultCounts := make(map[string]uint64)
-	for _, res := range c.replies[ts] {
+	for _, res := range c.replies[reqTS] {
 		resultCounts[string(res)]++
 
-		if resultCounts[string(res)] == (c.f + 1) {
-			delete(c.pending, ts)
-			delete(c.replies, ts)
+		if resultCounts[string(res)] == c.f+1 && bctx.ClientID == c.selfID && bctx.RequestTimestamp == reqTS && len(bctx.Result) > 0 {
+			delete(c.pending, reqTS)
+			delete(c.replies, reqTS)
 
 			select {
 			case c.ConsensusC <- res:
@@ -901,26 +1387,12 @@ func (c *BFTClient) Step(ctx context.Context, m *pb.Message) error {
 			return nil
 		}
 	}
+
 	return nil
 }
 
-func (c *BFTClient) verifyMessage(m *pb.Message) (int64, error) {
-	pubKey, ok := c.nodePubKeys[m.GetFrom()]
-	if !ok {
-		return 0, ErrUnknownSigner
-	}
-
-	ts, origCtx, err := VerifyBFTMessageSignature(m, pubKey)
-	if err != nil {
-		return 0, err
-	}
-
-	m.Context = origCtx
-	return ts, nil
-}
-
 func (c *BFTClient) AddClientProof(m *pb.Message) (int64, error) {
-	m.From = new(uint64(c.selfID))
+	m.From = u64p(c.selfID)
 	origCtx := normalizeContext(m.Context)
 
 	c.mu.Lock()
@@ -938,4 +1410,80 @@ func (c *BFTClient) AddClientProof(m *pb.Message) (int64, error) {
 	sig := ed25519.Sign(c.priv, data)
 	m.Context = packSignature(sig, ts, origCtx)
 	return ts, nil
+}
+
+func (bn *BFTNode) validateBFTMessage(signedMsg *pb.Message, bctx BFTContext) error {
+	if signedMsg.GetType() != pb.MsgApp {
+		return ErrInvalidBFTMessage
+	}
+
+	switch bctx.Phase {
+	case PhasePrePrepare:
+		return bn.validatePrePrepareMessage(signedMsg, bctx)
+
+	case PhasePrepare:
+		return bn.validatePrepareMessage(signedMsg, bctx)
+
+	case PhaseCommit:
+		return bn.validateCommitMessage(signedMsg, bctx)
+
+	case PhaseCheckpoint:
+		return bn.validateCheckpointMessage(signedMsg, bctx)
+
+	case PhaseViewChange:
+		return bn.validateIncomingViewChangeMessage(signedMsg, bctx, bctx.View)
+
+	case PhaseNewView:
+		return bn.validateNewViewMessage(signedMsg, bctx)
+
+	case PhaseReply:
+		return bn.validateReplyMessage(signedMsg, bctx)
+
+	default:
+		return ErrInvalidBFTContext
+	}
+}
+
+func (c *BFTClient) verifyMessage(m *pb.Message) error {
+	pubKey, ok := c.nodePubKeys[m.GetFrom()]
+	if !ok {
+		return ErrUnknownSigner
+	}
+
+	_, origCtx, err := VerifyBFTMessageSignature(m, pubKey)
+	if err != nil {
+		return err
+	}
+
+	m.Context = origCtx
+	return nil
+}
+
+func (bn *BFTNode) ConstructReply(key bftSeqKey, result []byte) (*pb.Message, error) {
+	clientID := bn.requestClient[key]
+	requestTS := bn.requestTS[key]
+
+	if clientID == 0 || requestTS == 0 {
+		return nil, ErrInvalidBFTContext
+	}
+
+	bctx := BFTContext{
+		Phase:            PhaseReply,
+		View:             bn.view,
+		RequestTimestamp: requestTS,
+		ClientID:         clientID,
+		Result:           append([]byte(nil), result...),
+	}
+
+	encCtx, err := encodeBFTContext(bctx)
+	if err != nil {
+		return nil, err
+	}
+
+	return &pb.Message{
+		Type:    pb.MsgApp.Enum(),
+		From:    u64p(bn.selfID),
+		To:      u64p(clientID),
+		Context: encCtx,
+	}, nil
 }

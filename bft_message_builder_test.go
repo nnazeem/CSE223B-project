@@ -37,13 +37,21 @@ func TestBFTMessageBuilder_ConstructPrePrepare(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
 	builder := NewBFTMessageBuilder(1, priv, &ClientProofConfig{Now: func() time.Time { return now }})
 
+	_, clientPriv, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+	requestTS := int64(1_700_000_000_123)
 	request := pb.Message{
 		Type: pb.MsgProp.Enum(),
 		From: u64Ptr(100),
+		To:   u64Ptr(1),
 		Entries: []*pb.Entry{{
 			Data: []byte("write:k=v"),
 		}},
 	}
+	reqData, err := messageSignBytes(&request, normalizeContext(request.Context), requestTS)
+	require.NoError(t, err)
+	request.Context = packSignature(ed25519.Sign(clientPriv, reqData), requestTS, normalizeContext(request.Context))
+
 	bctxPP, ppMsg, _, err := builder.ConstructPrePrepare(2, 7, 42, request)
 	require.NoError(t, err)
 	expectedDigest, err := hashEntryBatch(request.GetEntries())
@@ -52,6 +60,8 @@ func TestBFTMessageBuilder_ConstructPrePrepare(t *testing.T) {
 	require.Equal(t, uint64(7), bctxPP.View)
 	require.Equal(t, uint64(42), bctxPP.SeqNum)
 	require.Equal(t, expectedDigest, bctxPP.Digest)
+	require.Equal(t, uint64(100), bctxPP.ClientID)
+	require.Equal(t, requestTS, bctxPP.RequestTimestamp)
 	require.Equal(t, pb.MsgApp, ppMsg.GetType())
 	require.Equal(t, uint64(1), ppMsg.GetFrom())
 	require.Equal(t, uint64(2), ppMsg.GetTo())
@@ -65,6 +75,8 @@ func TestBFTMessageBuilder_ConstructPrePrepare(t *testing.T) {
 	require.Equal(t, uint64(7), decodedPP.View)
 	require.Equal(t, uint64(42), decodedPP.SeqNum)
 	require.Equal(t, bctxPP.Digest, decodedPP.Digest)
+	require.Equal(t, uint64(100), decodedPP.ClientID)
+	require.Equal(t, requestTS, decodedPP.RequestTimestamp)
 }
 
 func TestBFTMessageBuilder_ConstructPrePrepare_MultiEntryDigestCoversFullBatch(t *testing.T) {
@@ -90,6 +102,15 @@ func TestBFTMessageBuilder_ConstructPrePrepare_MultiEntryDigestCoversFullBatch(t
 			{Data: []byte("second-b")},
 		},
 	}
+
+	_, clientPriv, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+	dataA, err := messageSignBytes(&requestA, normalizeContext(requestA.Context), int64(101))
+	require.NoError(t, err)
+	requestA.Context = packSignature(ed25519.Sign(clientPriv, dataA), int64(101), normalizeContext(requestA.Context))
+	dataB, err := messageSignBytes(&requestB, normalizeContext(requestB.Context), int64(102))
+	require.NoError(t, err)
+	requestB.Context = packSignature(ed25519.Sign(clientPriv, dataB), int64(102), normalizeContext(requestB.Context))
 
 	bctxA, _, _, err := builder.ConstructPrePrepare(2, 7, 42, requestA)
 	require.NoError(t, err)
@@ -169,19 +190,39 @@ func TestBFTMessageBuilder_ConstructViewChange(t *testing.T) {
 	now := time.Unix(1_700_000_001, 0)
 	builder := NewBFTMessageBuilder(2, priv, &ClientProofConfig{Now: func() time.Time { return now }})
 
+	checkpointDigest := hashData([]byte("cp"))
+	checkpointProof := BFTCheckpointProof{
+		SeqNum:      70,
+		Digest:      checkpointDigest,
+		Checkpoints: nil,
+	}
+
 	digest := hashData([]byte("m"))
-	checkpointProofs := []BFTCheckpointProof{{ReplicaID: 1, SeqNum: 70, Digest: hashData([]byte("cp"))}}
-	preparedProofs := []BFTPreparedProof{{View: 9, SeqNum: 77, Digest: digest}}
-	vcMsg, _, err := builder.ConstructViewChange(5, 10, 70, checkpointProofs, preparedProofs)
+	preparedProofs := []BFTPreparedProof{
+		{View: 9, SeqNum: 77, Digest: digest},
+	}
+
+	vcMsg, _, err := builder.ConstructViewChange(
+		5,
+		10,
+		70,
+		checkpointProof,
+		preparedProofs,
+	)
 	require.NoError(t, err)
+
 	_, vcCtxBytes, err := VerifyBFTMessageSignature(&vcMsg, pub)
 	require.NoError(t, err)
+
 	vcCtx, err := decodeBFTContext(vcCtxBytes)
 	require.NoError(t, err)
+
 	require.Equal(t, PhaseViewChange, vcCtx.Phase)
 	require.Equal(t, uint64(10), vcCtx.View)
+	require.Equal(t, uint64(70), vcCtx.SeqNum)
 	require.Equal(t, uint64(70), vcCtx.CheckpointSeqNum)
-	require.Equal(t, checkpointProofs, vcCtx.CheckpointProofs)
+	require.Equal(t, checkpointDigest, vcCtx.CheckpointDigest)
+	require.Equal(t, checkpointProof, vcCtx.CheckpointProofs)
 	require.Equal(t, preparedProofs, vcCtx.PreparedProofs)
 }
 
@@ -192,14 +233,64 @@ func TestBFTMessageBuilder_ConstructNewView(t *testing.T) {
 	now := time.Unix(1_700_000_001, 0)
 	builder := NewBFTMessageBuilder(2, priv, &ClientProofConfig{Now: func() time.Time { return now }})
 
-	viewSet := [][]byte{[]byte("vc1"), []byte("vc2")}
-	prePrepareSet := []BFTPrePrepareMeta{{View: 10, SeqNum: 78, Digest: hashData([]byte("o1"))}}
+	viewSet := []pb.Message{
+		{
+			Type: pb.MsgApp.Enum(),
+			From: u64Ptr(1),
+			To:   u64Ptr(2),
+		},
+		{
+			Type: pb.MsgApp.Enum(),
+			From: u64Ptr(3),
+			To:   u64Ptr(2),
+		},
+	}
+
+	clientReq := &pb.Message{
+		Type:    pb.MsgProp.Enum(),
+		From:    u64Ptr(100),
+		To:      u64Ptr(2),
+		Entries: []*pb.Entry{{Data: []byte("o1")}},
+	}
+	_, clientPriv, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+	reqData, err := messageSignBytes(clientReq, normalizeContext(clientReq.Context), int64(123))
+	require.NoError(t, err)
+	clientReq.Context = packSignature(ed25519.Sign(clientPriv, reqData), int64(123), normalizeContext(clientReq.Context))
+
+	digest, err := hashEntryBatch(clientReq.GetEntries())
+	require.NoError(t, err)
+
+	ppCtx := BFTContext{
+		Phase:            PhasePrePrepare,
+		View:             11,
+		SeqNum:           78,
+		Digest:           digest,
+		RequestTimestamp: 123,
+		ClientID:         100,
+		ClientRequest:    *clientReq,
+	}
+	encCtx, err := encodeBFTContext(ppCtx)
+	require.NoError(t, err)
+
+	prePrepareSet := []pb.Message{
+		{
+			Type:    pb.MsgApp.Enum(),
+			From:    u64Ptr(2),
+			Context: encCtx,
+			Entries: []*pb.Entry{{Data: []byte("o1")}},
+		},
+	}
+
 	nvMsg, _, err := builder.ConstructNewView(6, 11, viewSet, prePrepareSet)
 	require.NoError(t, err)
+
 	_, nvCtxBytes, err := VerifyBFTMessageSignature(&nvMsg, pub)
 	require.NoError(t, err)
+
 	nvCtx, err := decodeBFTContext(nvCtxBytes)
 	require.NoError(t, err)
+
 	require.Equal(t, PhaseNewView, nvCtx.Phase)
 	require.Equal(t, uint64(11), nvCtx.View)
 	require.Equal(t, viewSet, nvCtx.ViewSet)

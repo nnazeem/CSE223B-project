@@ -6,8 +6,8 @@ import (
 	"encoding/binary"
 	"sync"
 
-	"google.golang.org/protobuf/proto"
 	pb "go.etcd.io/raft/v3/raftpb"
+	"google.golang.org/protobuf/proto"
 )
 
 // BFTMessageBuilder constructs and signs BFT client request messages.
@@ -109,19 +109,65 @@ func (b *BFTMessageBuilder) ConstructPrePrepare(to uint64, view uint64, seqNum u
 		return BFTContext{}, pb.Message{}, 0, err
 	}
 
-	bctx := BFTContext{
-		Phase:  PhasePrePrepare,
-		View:   view,
-		SeqNum: seqNum,
-		Digest: digest,
+	_, requestTS, _, err := parseSignature(request.Context)
+	if err != nil {
+		return BFTContext{}, pb.Message{}, 0, err
 	}
 
 	ts := b.nextTimestamp()
+	bctx := BFTContext{
+		Phase:            PhasePrePrepare,
+		View:             view,
+		SeqNum:           seqNum,
+		Digest:           digest,
+		RequestTimestamp: requestTS,
+		ClientID:         request.GetFrom(),
+		ClientRequest:    *proto.Clone(&request).(*pb.Message),
+	}
+
 	m, err := b.constructPhaseMessageAt(to, bctx, entries, ts)
 	if err != nil {
 		return BFTContext{}, pb.Message{}, 0, err
 	}
 	return bctx, m, ts, nil
+}
+
+func hashMessageBatch(msgs []*pb.Message) ([32]byte, error) {
+	h := sha256.New()
+	mo := proto.MarshalOptions{Deterministic: true}
+
+	var lenBuf [8]byte
+	binary.BigEndian.PutUint64(lenBuf[:], uint64(len(msgs)))
+	if _, err := h.Write(lenBuf[:]); err != nil {
+		return [32]byte{}, err
+	}
+
+	for _, e := range msgs {
+		if e == nil {
+			if _, err := h.Write([]byte{0}); err != nil {
+				return [32]byte{}, err
+			}
+			continue
+		}
+		if _, err := h.Write([]byte{1}); err != nil {
+			return [32]byte{}, err
+		}
+		eb, err := mo.Marshal(e)
+		if err != nil {
+			return [32]byte{}, err
+		}
+		binary.BigEndian.PutUint64(lenBuf[:], uint64(len(eb)))
+		if _, err := h.Write(lenBuf[:]); err != nil {
+			return [32]byte{}, err
+		}
+		if _, err := h.Write(eb); err != nil {
+			return [32]byte{}, err
+		}
+	}
+
+	var out [32]byte
+	copy(out[:], h.Sum(nil))
+	return out, nil
 }
 
 // hashEntryBatch hashes the complete entry batch deterministically, preserving
@@ -202,13 +248,17 @@ func (b *BFTMessageBuilder) ConstructCommit(to uint64, view uint64, seqNum uint6
 
 // ConstructCheckpoint builds a signed CHECKPOINT message:
 // <CHECKPOINT, n, d, i>_sigma_i.
-func (b *BFTMessageBuilder) ConstructCheckpoint(to uint64, checkpointSeq uint64, stateDigest [32]byte) (pb.Message, int64, error) {
+func (b *BFTMessageBuilder) ConstructCheckpoint(
+	to uint64,
+	checkpointSeq uint64,
+	stateDigest [32]byte,
+) (pb.Message, int64, error) {
 	bctx := BFTContext{
-		Phase:             PhaseCheckpoint,
-		CheckpointSeqNum:  checkpointSeq,
-		CheckpointDigest:  stateDigest,
-		SeqNum:            checkpointSeq,
-		Digest:            stateDigest,
+		Phase:            PhaseCheckpoint,
+		SeqNum:           checkpointSeq,
+		Digest:           stateDigest,
+		CheckpointSeqNum: checkpointSeq,
+		CheckpointDigest: stateDigest,
 	}
 
 	ts := b.nextTimestamp()
@@ -225,15 +275,16 @@ func (b *BFTMessageBuilder) ConstructViewChange(
 	to uint64,
 	view uint64,
 	lastStableSeq uint64,
-	checkpointProofs []BFTCheckpointProof,
+	checkpointProof BFTCheckpointProof,
 	preparedProofs []BFTPreparedProof,
 ) (pb.Message, int64, error) {
 	bctx := BFTContext{
 		Phase:            PhaseViewChange,
 		View:             view,
 		CheckpointSeqNum: lastStableSeq,
+		CheckpointDigest: checkpointProof.Digest,
 		SeqNum:           lastStableSeq,
-		CheckpointProofs: append([]BFTCheckpointProof(nil), checkpointProofs...),
+		CheckpointProofs: checkpointProof,
 		PreparedProofs:   append([]BFTPreparedProof(nil), preparedProofs...),
 	}
 
@@ -251,14 +302,14 @@ func (b *BFTMessageBuilder) ConstructViewChange(
 func (b *BFTMessageBuilder) ConstructNewView(
 	to uint64,
 	view uint64,
-	viewSet [][]byte,
-	prePrepareSet []BFTPrePrepareMeta,
+	viewSet []pb.Message,
+	prePrepareSet []pb.Message,
 ) (pb.Message, int64, error) {
 	bctx := BFTContext{
 		Phase:         PhaseNewView,
 		View:          view,
-		ViewSet:       append([][]byte(nil), viewSet...),
-		PrePrepareSet: append([]BFTPrePrepareMeta(nil), prePrepareSet...),
+		ViewSet:       append([]pb.Message(nil), viewSet...),
+		PrePrepareSet: append([]pb.Message(nil), prePrepareSet...),
 	}
 
 	ts := b.nextTimestamp()

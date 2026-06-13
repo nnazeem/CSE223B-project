@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/golang/protobuf/proto"
+
 	"github.com/stretchr/testify/require"
 	pb "go.etcd.io/raft/v3/raftpb"
 )
@@ -13,15 +15,17 @@ import (
 // checkpointTestFixture holds a 4-node cluster (f=1) wired for checkpoint tests.
 type checkpointTestFixture struct {
 	node      *BFTNode
+	client    *BFTClient
 	nodePrivs map[uint64]ed25519.PrivateKey
 	ctx       context.Context
 }
 
 func newCheckpointTestFixture(t *testing.T) checkpointTestFixture {
 	t.Helper()
-	node, _, nodePrivs, _ := setupCluster(t)
+	node, client, nodePrivs, _ := setupCluster(t)
 	return checkpointTestFixture{
 		node:      node,
+		client:    client,
 		nodePrivs: nodePrivs,
 		ctx:       context.Background(),
 	}
@@ -58,8 +62,32 @@ func (f checkpointTestFixture) stepCheckpoint(t *testing.T, from, seq uint64, di
 }
 
 func (f checkpointTestFixture) signPrePrepare(from, seq uint64, payload []byte) *pb.Message {
-	digest := hashData(payload)
-	bctx := BFTContext{Phase: PhasePrePrepare, View: 0, SeqNum: seq, Digest: digest}
+	reqTS := int64(seq)
+	clientReq := &pb.Message{
+		Type:    pb.MsgProp.Enum(),
+		From:    u64p(100),
+		To:      u64p(1),
+		Entries: []*pb.Entry{{Data: payload}},
+	}
+	reqData, err := messageSignBytes(clientReq, normalizeContext(clientReq.Context), reqTS)
+	if err != nil {
+		panic(err)
+	}
+	clientReq.Context = packSignature(ed25519.Sign(f.client.priv, reqData), reqTS, normalizeContext(clientReq.Context))
+
+	digest, err := hashEntryBatch(clientReq.GetEntries())
+	if err != nil {
+		panic(err)
+	}
+	bctx := BFTContext{
+		Phase:            PhasePrePrepare,
+		View:             0,
+		SeqNum:           seq,
+		Digest:           digest,
+		RequestTimestamp: reqTS,
+		ClientID:         100,
+		ClientRequest:    *proto.Clone(clientReq).(*pb.Message),
+	}
 	encCtx, err := encodeBFTContext(bctx)
 	if err != nil {
 		panic(err)
@@ -70,7 +98,7 @@ func (f checkpointTestFixture) signPrePrepare(from, seq uint64, payload []byte) 
 		From:    u64p(from),
 		Term:    u64p(1),
 		Context: encCtx,
-		Entries: []*pb.Entry{{Data: payload}},
+		Entries: cloneEntries(clientReq.GetEntries()),
 	}
 	origCtx := normalizeContext(msg.Context)
 	data, err := messageSignBytes(msg, origCtx, int64(seq))
@@ -86,8 +114,18 @@ func (f checkpointTestFixture) seedRequestDigests(t *testing.T, through uint64) 
 	f.node.mu.Lock()
 	defer f.node.mu.Unlock()
 	for s := uint64(1); s <= through; s++ {
+		payload := []byte(fmt.Sprintf("req-%d", s))
+		msg := &pb.Message{
+			Type:    pb.MsgApp.Enum(),
+			From:    u64p(100),
+			Term:    u64p(1),
+			Entries: []*pb.Entry{{Data: payload}},
+		}
+		digest, err := hashEntryBatch(msg.GetEntries())
+		require.NoError(t, err)
 		key := bftSeqKey{view: 0, seq: s}
-		f.node.pp[key] = hashData([]byte(fmt.Sprintf("req-%d", s)))
+		f.node.pp[key] = digest
+		f.node.log[s] = msg
 	}
 }
 
@@ -130,13 +168,15 @@ func TestCheckpoint_QuorumStabilizes(t *testing.T) {
 	require.NotNil(t, f.node.stableCheckpoint)
 	require.Equal(t, seq, f.node.stableCheckpoint.SeqNum)
 	require.Equal(t, digest, f.node.stableCheckpoint.Digest)
-	require.Len(t, f.node.stableCheckpoint.Proofs, 3)
+	require.Len(t, f.node.stableCheckpoint.Proof.Checkpoints, 3)
 	require.Equal(t, seq, f.node.lowW)
 	require.Equal(t, seq+WatermarkWindow, f.node.highW)
 
 	sc := f.node.StableCheckpoint()
 	require.NotNil(t, sc)
-	require.Len(t, sc.Proofs, 3)
+	require.Len(t, sc.Proof.Checkpoints, 3)
+	require.Equal(t, seq, sc.Proof.SeqNum)
+	require.Equal(t, digest, sc.Proof.Digest)
 }
 
 func TestCheckpoint_ConflictingDigestsDoNotStabilize(t *testing.T) {
@@ -183,12 +223,13 @@ func TestCheckpoint_StateDigestAt(t *testing.T) {
 	got := f.node.stateDigestAt(3)
 	f.node.mu.Unlock()
 
-	var wantBuf []byte
+	var wantMsgs []*pb.Message
 	for s := uint64(1); s <= 3; s++ {
-		d := hashData([]byte(fmt.Sprintf("req-%d", s)))
-		wantBuf = append(wantBuf, d[:]...)
+		wantMsgs = append(wantMsgs, f.node.log[s])
 	}
-	require.Equal(t, hashData(wantBuf), got)
+	want, err := hashMessageBatch(wantMsgs)
+	require.NoError(t, err)
+	require.Equal(t, want, got)
 }
 
 func TestCheckpoint_constructCheckpointIfNeededSkipsNonInterval(t *testing.T) {
@@ -228,15 +269,36 @@ func TestCheckpoint_GarbageCollectPrunesOldState(t *testing.T) {
 	f.seedRequestDigests(t, 150)
 	dig := f.localDigest(t, 100)
 
+	req := &pb.Message{
+		Type:    pb.MsgApp.Enum(),
+		From:    u64p(0),
+		Term:    u64p(1),
+		Entries: []*pb.Entry{{Data: []byte("x")}},
+	}
+
+	p := &pb.Message{
+		Type:    pb.MsgApp.Enum(),
+		From:    u64p(0),
+		Term:    u64p(1),
+		Entries: []*pb.Entry{{Data: []byte("y")}},
+	}
+
+	ch := &pb.Message{
+		Type:    pb.MsgApp.Enum(),
+		From:    u64p(0),
+		Term:    u64p(1),
+		Entries: []*pb.Entry{{Data: []byte("z")}},
+	}
+
 	f.node.mu.Lock()
 	for _, seq := range []uint64{50, 100, 150} {
 		key := bftSeqKey{view: 0, seq: seq}
-		f.node.prepares[key] = map[uint64]struct{}{2: {}}
+		f.node.prepares[key] = map[uint64]*pb.Message{2: p}
 		f.node.commits[key] = map[uint64]struct{}{2: {}}
-		f.node.reqs[key] = []*pb.Entry{{Data: []byte("x")}}
+		f.node.reqs[key] = req
 	}
 	for _, replica := range []uint64{1, 2, 3} {
-		f.node.recordCheckpoint(100, dig, replica)
+		f.node.recordCheckpoint(100, dig, replica, ch)
 	}
 	f.node.stabilizeCheckpoint(100, dig)
 	f.node.mu.Unlock()
@@ -260,10 +322,10 @@ func TestCheckpoint_WatermarkBlocksStalePrePrepare(t *testing.T) {
 		f.stepCheckpoint(t, from, 100, digest)
 	}
 
-	err := f.node.Step(f.ctx, f.signPrePrepare(2, 100, []byte("late")))
+	err := f.node.Step(f.ctx, f.signPrePrepare(1, 100, []byte("late")))
 	require.ErrorContains(t, err, "sequence number out of bounds")
 
-	err = f.node.Step(f.ctx, f.signPrePrepare(2, 101, []byte("ok")))
+	err = f.node.Step(f.ctx, f.signPrePrepare(1, 101, []byte("ok")))
 	require.NoError(t, err)
 }
 
@@ -291,13 +353,27 @@ func TestCheckpoint_OnCommitQuorumTriggersAtInterval(t *testing.T) {
 	seq := uint64(CheckpointInterval)
 	payload := []byte("batch-at-checkpoint")
 
+	msg := &pb.Message{
+		Type:    pb.MsgApp.Enum(),
+		From:    u64p(0),
+		Term:    u64p(1),
+		Entries: []*pb.Entry{{Data: payload}},
+	}
+
 	f.node.mu.Lock()
 	key := bftSeqKey{view: 0, seq: seq}
-	f.node.pp[key] = hashData(payload)
-	f.node.reqs[key] = []*pb.Entry{{Data: payload}}
+	digest, err := hashEntryBatch(msg.GetEntries())
+	require.NoError(t, err)
+	f.node.pp[key] = digest
+	f.node.reqs[key] = msg
 	for s := uint64(1); s < seq; s++ {
+		payload := []byte(fmt.Sprintf("req-%d", s))
+		prev := &pb.Message{Type: pb.MsgApp.Enum(), From: u64p(100), Term: u64p(1), Entries: []*pb.Entry{{Data: payload}}}
+		prevDigest, err := hashEntryBatch(prev.GetEntries())
+		require.NoError(t, err)
 		k := bftSeqKey{view: 0, seq: s}
-		f.node.pp[k] = hashData([]byte(fmt.Sprintf("req-%d", s)))
+		f.node.pp[k] = prevDigest
+		f.node.log[s] = prev
 	}
 	f.node.onCommitQuorum(key)
 	f.node.mu.Unlock()

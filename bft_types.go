@@ -4,7 +4,28 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/gob"
+	"errors"
 	"time"
+
+	pb "go.etcd.io/raft/v3/raftpb"
+)
+
+var (
+	ErrInvalidBFTMessage     = errors.New("raft: invalid bft message")
+	ErrInvalidBFTContext     = errors.New("raft: invalid bft context")
+	ErrInvalidCheckpoint     = errors.New("raft: invalid checkpoint message")
+	ErrInvalidViewChange     = errors.New("raft: invalid view-change message")
+	ErrInvalidNewView        = errors.New("raft: invalid new-view message")
+	ErrInvalidPreparedProof  = errors.New("raft: invalid prepared proof")
+	ErrInvalidCheckpointCert = errors.New("raft: invalid checkpoint certificate")
+)
+
+// BFTPhase identifies the PBFT stage represented in BFTContext.
+type BFTNodePhase uint8
+
+const (
+	Normal BFTNodePhase = iota
+	ViewChange
 )
 
 // BFTPhase identifies the PBFT stage represented in BFTContext.
@@ -24,23 +45,17 @@ const (
 
 // BFTCheckpointProof captures one checkpoint proof.
 type BFTCheckpointProof struct {
-	ReplicaID uint64
-	SeqNum    uint64
-	Digest    [32]byte // of state hash
-}
-// BFTPreparedProof captures one prepared request proof Pm in a view-change.
-type BFTPreparedProof struct {
-	View   uint64
-	SeqNum uint64
-	Digest [32]byte
+	SeqNum      uint64
+	Digest      [32]byte // of state hash
+	Checkpoints []pb.Message
 }
 
-// BFTPrePrepareMeta captures one pre-prepare metadata item in a new-view O set.
-// It intentionally excludes the piggybacked request payload.
-type BFTPrePrepareMeta struct {
-	View   uint64
-	SeqNum uint64
-	Digest [32]byte
+// BFTPreparedProof captures one prepared request proof Pm in a view-change.
+type BFTPreparedProof struct {
+	View     uint64
+	SeqNum   uint64
+	Digest   [32]byte
+	Prepares []pb.Message
 }
 
 // BFTContext carries PBFT metadata in the raft message context payload.
@@ -53,6 +68,7 @@ type BFTContext struct {
 	// Reply fields.
 	RequestTimestamp int64
 	ClientID         uint64
+	ClientRequest    pb.Message
 	Result           []byte
 
 	// Checkpoint fields.
@@ -60,10 +76,10 @@ type BFTContext struct {
 	CheckpointDigest [32]byte
 
 	// View-change/new-view evidence sets.
-	CheckpointProofs []BFTCheckpointProof
+	CheckpointProofs BFTCheckpointProof
 	PreparedProofs   []BFTPreparedProof
-	ViewSet          [][]byte
-	PrePrepareSet    []BFTPrePrepareMeta
+	ViewSet          []pb.Message
+	PrePrepareSet    []pb.Message
 }
 
 // ClientProofConfig configures freshness checks for client-originated proofs.
@@ -105,4 +121,23 @@ func decodeBFTContext(data []byte) (BFTContext, error) {
 	}
 	err := gob.NewDecoder(bytes.NewReader(data)).Decode(&bctx)
 	return bctx, err
+}
+
+func (p BFTPhase) IsBFTMessagePhase() bool {
+	switch p {
+	case PhasePrePrepare,
+		PhasePrepare,
+		PhaseCommit,
+		PhaseCheckpoint,
+		PhaseViewChange,
+		PhaseNewView,
+		PhaseReply:
+		return true
+	default:
+		return false
+	}
+}
+
+func zeroDigest(d [32]byte) bool {
+	return d == [32]byte{}
 }

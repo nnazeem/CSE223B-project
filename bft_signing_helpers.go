@@ -77,19 +77,28 @@ func normalizeContext(ctx []byte) []byte {
 	return append([]byte(nil), ctx...)
 }
 
-// messageSignBytes produces the byte slice that should be signed for a given message and timestamp.
 func messageSignBytes(m *pb.Message, origCtx []byte, ts int64) ([]byte, error) {
 	clone := proto.Clone(m).(*pb.Message)
 	clone.Context = normalizeContext(origCtx)
+
+	// Client REQUEST signatures are recipient-independent so backups can
+	// forward them to the primary without invalidating the client signature.
+	if clone.GetType() == pb.MsgProp {
+		clone.To = nil
+	}
+
 	mb, err := proto.Marshal(clone)
 	if err != nil {
 		return nil, err
 	}
+
 	out := make([]byte, 0, len(sigMagic)+8+len(mb))
 	out = append(out, []byte(sigMagic)...)
+
 	tb := make([]byte, 8)
 	binary.BigEndian.PutUint64(tb, uint64(ts))
 	out = append(out, tb...)
+
 	out = append(out, mb...)
 	return out, nil
 }

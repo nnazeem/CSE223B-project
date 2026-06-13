@@ -17,12 +17,25 @@ type mockNode struct {
 }
 
 func (m *mockNode) Step(ctx context.Context, msg *pb.Message) error { return nil }
-func (m *mockNode) Propose(ctx context.Context, data []byte) error { return nil }
-func (m *mockNode) Ready() <-chan Ready                            { return m.readyc }
-func (m *mockNode) Tick()                                          {}
-func (m *mockNode) Advance()                                       {}
+func (m *mockNode) Propose(ctx context.Context, data []byte) error  { return nil }
+func (m *mockNode) Ready() <-chan Ready                             { return m.readyc }
+func (m *mockNode) Tick()                                           {}
+func (m *mockNode) Advance()                                        {}
+
+func entryDigest(t *testing.T, payload []byte) [32]byte {
+	t.Helper()
+	digest, err := hashEntryBatch([]*pb.Entry{{Data: payload}})
+	require.NoError(t, err)
+	return digest
+}
 
 func setupCluster(t *testing.T) (*BFTNode, *BFTClient, map[uint64]ed25519.PrivateKey, *mockNode) {
+	return setupClusterForNode(t, 1)
+}
+
+func setupClusterForNode(t *testing.T, selfID uint64) (*BFTNode, *BFTClient, map[uint64]ed25519.PrivateKey, *mockNode) {
+	t.Helper()
+
 	pubC, privC, err := ed25519.GenerateKey(nil)
 	require.NoError(t, err)
 
@@ -30,7 +43,8 @@ func setupCluster(t *testing.T) (*BFTNode, *BFTClient, map[uint64]ed25519.Privat
 	nodePrivs := make(map[uint64]ed25519.PrivateKey)
 
 	for i := uint64(1); i <= 4; i++ {
-		pub, priv, _ := ed25519.GenerateKey(nil)
+		pub, priv, err := ed25519.GenerateKey(nil)
+		require.NoError(t, err)
 		nodePubs[i] = pub
 		nodePrivs[i] = priv
 	}
@@ -39,10 +53,18 @@ func setupCluster(t *testing.T) (*BFTNode, *BFTClient, map[uint64]ed25519.Privat
 	cfg := &ClientProofConfig{MaxAge: 30 * time.Second, Now: time.Now}
 
 	mn := &mockNode{readyc: make(chan Ready, 10)}
-	bftNode := WrapBFTNode(mn, 1, 4, nodePrivs[1], nodePubs, clientIDs, pubC, cfg)
+	bftNode := WrapBFTNode(mn, selfID, 4, nodePrivs[selfID], nodePubs, clientIDs, pubC, cfg)
 	bftClient := NewBFTClient(100, 4, privC, nodePubs, clientIDs, pubC, cfg)
 
 	return bftNode, bftClient, nodePrivs, mn
+}
+
+func signTestNodeMessage(t *testing.T, m *pb.Message, priv ed25519.PrivateKey, ts int64) {
+	t.Helper()
+	origCtx := normalizeContext(m.Context)
+	data, err := messageSignBytes(m, origCtx, ts)
+	require.NoError(t, err)
+	m.Context = packSignature(ed25519.Sign(priv, data), ts, origCtx)
 }
 
 func TestBFT_VerifyMessageSignature_Utility(t *testing.T) {
@@ -89,32 +111,49 @@ func TestBFT_Client_ReplayAttack(t *testing.T) {
 }
 
 func TestBFT_Node_PrepareQuorum(t *testing.T) {
-	node, _, nodePrivs, mock := setupCluster(t)
+	node, client, nodePrivs, mock := setupClusterForNode(t, 2)
 	ctx := context.Background()
 
-	bctx := BFTContext{Phase: PhasePrePrepare, View: 0, SeqNum: 1, Digest: hashData([]byte("test"))}
-	encCtx, _ := encodeBFTContext(bctx)
+	payload := []byte("test")
+	digest := entryDigest(t, payload)
+	clientReq := signClientRequestForTest(t, 100, 1, payload, client.priv, 100)
 
-	msg := &pb.Message{Type: pb.MsgApp.Enum(), From: u64p(2), Term: u64p(1), Context: encCtx}
-	origCtx := normalizeContext(msg.Context)
-	data, _ := messageSignBytes(msg, origCtx, 100)
-	msg.Context = packSignature(ed25519.Sign(nodePrivs[2], data), 100, origCtx)
+	bctx := BFTContext{
+		Phase:            PhasePrePrepare,
+		View:             0,
+		SeqNum:           1,
+		Digest:           digest,
+		RequestTimestamp: 100,
+		ClientID:         100,
+		ClientRequest:    *proto.Clone(clientReq).(*pb.Message),
+	}
+	encCtx, err := encodeBFTContext(bctx)
+	require.NoError(t, err)
 
-	_ = node.Step(ctx, msg)
+	ppMsg := &pb.Message{
+		Type:    pb.MsgApp.Enum(),
+		From:    u64p(1), // primary for view 0
+		Term:    u64p(1),
+		Context: encCtx,
+		Entries: []*pb.Entry{{Data: payload}},
+	}
+	signTestNodeMessage(t, ppMsg, nodePrivs[1], 100)
+
+	err = node.Step(ctx, ppMsg)
+	require.NoError(t, err)
 
 	rd := <-node.Ready()
 	require.NotEmpty(t, rd.Messages)
 	node.Advance()
 
 	bctx.Phase = PhasePrepare
-	encPCtx, _ := encodeBFTContext(bctx)
+	encPCtx, err := encodeBFTContext(bctx)
+	require.NoError(t, err)
 
 	pMsg := &pb.Message{Type: pb.MsgApp.Enum(), From: u64p(3), Term: u64p(1), Context: encPCtx}
-	origPCtx := normalizeContext(pMsg.Context)
-	pData, _ := messageSignBytes(pMsg, origPCtx, 200)
-	pMsg.Context = packSignature(ed25519.Sign(nodePrivs[3], pData), 200, origPCtx)
+	signTestNodeMessage(t, pMsg, nodePrivs[3], 200)
 
-	err := node.Step(ctx, pMsg)
+	err = node.Step(ctx, pMsg)
 	require.NoError(t, err)
 
 	mock.readyc <- Ready{}
@@ -122,11 +161,11 @@ func TestBFT_Node_PrepareQuorum(t *testing.T) {
 	require.NotEmpty(t, rd2.Messages)
 	node.Advance()
 
-	// Strip the outbound signature to verify inner contents
-	_, cOrigCtx, err := VerifyBFTMessageSignature(rd2.Messages[0], node.nodePubKeys[1])
+	_, cOrigCtx, err := VerifyBFTMessageSignature(rd2.Messages[0], node.nodePubKeys[2])
 	require.NoError(t, err)
 
-	cCtx, _ := decodeBFTContext(cOrigCtx)
+	cCtx, err := decodeBFTContext(cOrigCtx)
+	require.NoError(t, err)
 	require.Equal(t, PhaseCommit, cCtx.Phase)
 }
 
@@ -135,56 +174,134 @@ func TestBFT_Node_PrepareQuorum(t *testing.T) {
 // -------------------------------------------------------------
 
 func TestBFT_Node_EquivocatingLeader(t *testing.T) {
-	node, _, nodePrivs, _ := setupCluster(t)
+	node, client, nodePrivs, _ := setupClusterForNode(t, 2)
 	ctx := context.Background()
 
-	bctxA := BFTContext{Phase: PhasePrePrepare, View: 0, SeqNum: 1, Digest: hashData([]byte("A"))}
-	encA, _ := encodeBFTContext(bctxA)
-	msgA := &pb.Message{Type: pb.MsgApp.Enum(), From: u64p(2), Term: u64p(1), Context: encA}
+	payloadA := []byte("A")
+	digestA := entryDigest(t, payloadA)
+	clientReqA := signClientRequestForTest(t, 100, 1, payloadA, client.priv, 100)
 
-	dataA, _ := messageSignBytes(msgA, encA, 100)
-	msgA.Context = packSignature(ed25519.Sign(nodePrivs[2], dataA), 100, encA)
-	err := node.Step(ctx, msgA)
+	bctxA := BFTContext{
+		Phase:            PhasePrePrepare,
+		View:             0,
+		SeqNum:           1,
+		Digest:           digestA,
+		RequestTimestamp: 100,
+		ClientID:         100,
+		ClientRequest:    *proto.Clone(clientReqA).(*pb.Message),
+	}
+	encA, err := encodeBFTContext(bctxA)
 	require.NoError(t, err)
 
-	bctxB := BFTContext{Phase: PhasePrePrepare, View: 0, SeqNum: 1, Digest: hashData([]byte("B"))}
-	encB, _ := encodeBFTContext(bctxB)
-	msgB := &pb.Message{Type: pb.MsgApp.Enum(), From: u64p(2), Term: u64p(1), Context: encB}
+	msgA := &pb.Message{
+		Type:    pb.MsgApp.Enum(),
+		From:    u64p(1), // primary for view 0
+		Term:    u64p(1),
+		Context: encA,
+		Entries: []*pb.Entry{{Data: payloadA}},
+	}
+	signTestNodeMessage(t, msgA, nodePrivs[1], 100)
+	err = node.Step(ctx, msgA)
+	require.NoError(t, err)
+	rd := <-node.Ready()
+	require.NotEmpty(t, rd.Messages)
+	node.Advance()
 
-	dataB, _ := messageSignBytes(msgB, encB, 101)
-	msgB.Context = packSignature(ed25519.Sign(nodePrivs[2], dataB), 101, encB)
+	payloadB := []byte("B")
+	digestB := entryDigest(t, payloadB)
+	clientReqB := signClientRequestForTest(t, 100, 1, payloadB, client.priv, 101)
+
+	bctxB := BFTContext{
+		Phase:            PhasePrePrepare,
+		View:             0,
+		SeqNum:           1,
+		Digest:           digestB,
+		RequestTimestamp: 101,
+		ClientID:         100,
+		ClientRequest:    *proto.Clone(clientReqB).(*pb.Message),
+	}
+	encB, err := encodeBFTContext(bctxB)
+	require.NoError(t, err)
+
+	msgB := &pb.Message{
+		Type:    pb.MsgApp.Enum(),
+		From:    u64p(1), // same primary, conflicting digest
+		Term:    u64p(1),
+		Context: encB,
+		Entries: []*pb.Entry{{Data: payloadB}},
+	}
+	signTestNodeMessage(t, msgB, nodePrivs[1], 101)
 
 	err = node.Step(ctx, msgB)
 	require.ErrorContains(t, err, "conflicting pre-prepare digest")
 }
 
 func TestBFT_Node_OutOfBoundsSequence(t *testing.T) {
-	node, _, nodePrivs, _ := setupCluster(t)
+	node, client, nodePrivs, _ := setupClusterForNode(t, 2)
 	ctx := context.Background()
 
-	bctx := BFTContext{Phase: PhasePrePrepare, View: 0, SeqNum: 9999, Digest: hashData([]byte("data"))}
-	enc, _ := encodeBFTContext(bctx)
-	msg := &pb.Message{Type: pb.MsgApp.Enum(), From: u64p(2), Term: u64p(1), Context: enc}
+	payload := []byte("data")
+	digest := entryDigest(t, payload)
+	clientReq := signClientRequestForTest(t, 100, 1, payload, client.priv, 100)
 
-	data, _ := messageSignBytes(msg, enc, 100)
-	msg.Context = packSignature(ed25519.Sign(nodePrivs[2], data), 100, enc)
+	bctx := BFTContext{
+		Phase:            PhasePrePrepare,
+		View:             0,
+		SeqNum:           9999,
+		Digest:           digest,
+		RequestTimestamp: 100,
+		ClientID:         100,
+		ClientRequest:    *proto.Clone(clientReq).(*pb.Message),
+	}
+	enc, err := encodeBFTContext(bctx)
+	require.NoError(t, err)
 
-	err := node.Step(ctx, msg)
-	require.ErrorContains(t, err, "sequence number out of bounds")
+	msg := &pb.Message{
+		Type:    pb.MsgApp.Enum(),
+		From:    u64p(1), // primary for view 0
+		Term:    u64p(1),
+		Context: enc,
+		Entries: []*pb.Entry{{Data: payload}},
+	}
+
+	signTestNodeMessage(t, msg, nodePrivs[1], 100)
+
+	err = node.Step(ctx, msg)
+	require.ErrorContains(t, err, "sequence outside watermarks")
 }
 
 func TestBFT_Node_ImpossibleQuorum(t *testing.T) {
-	node, _, nodePrivs, mock := setupCluster(t)
+	node, client, nodePrivs, mock := setupClusterForNode(t, 2)
 	ctx := context.Background()
 
-	bctx := BFTContext{Phase: PhasePrePrepare, View: 0, SeqNum: 1, Digest: hashData([]byte("test"))}
-	encCtx, _ := encodeBFTContext(bctx)
-	msg := &pb.Message{Type: pb.MsgApp.Enum(), From: u64p(2), Term: u64p(1), Context: encCtx}
+	payload := []byte("test")
+	digest := entryDigest(t, payload)
+	clientReq := signClientRequestForTest(t, 100, 1, payload, client.priv, 100)
 
-	data, _ := messageSignBytes(msg, encCtx, 100)
-	msg.Context = packSignature(ed25519.Sign(nodePrivs[2], data), 100, encCtx)
+	bctx := BFTContext{
+		Phase:            PhasePrePrepare,
+		View:             0,
+		SeqNum:           1,
+		Digest:           digest,
+		RequestTimestamp: 100,
+		ClientID:         100,
+		ClientRequest:    *proto.Clone(clientReq).(*pb.Message),
+	}
+	encCtx, err := encodeBFTContext(bctx)
+	require.NoError(t, err)
 
-	_ = node.Step(ctx, msg)
+	msg := &pb.Message{
+		Type:    pb.MsgApp.Enum(),
+		From:    u64p(1), // primary for view 0
+		Term:    u64p(1),
+		Context: encCtx,
+		Entries: []*pb.Entry{{Data: payload}},
+	}
+
+	signTestNodeMessage(t, msg, nodePrivs[1], 100)
+
+	err = node.Step(ctx, msg)
+	require.NoError(t, err)
 	<-node.Ready()
 	node.Advance()
 
@@ -193,8 +310,10 @@ func TestBFT_Node_ImpossibleQuorum(t *testing.T) {
 	select {
 	case rd := <-node.Ready():
 		if len(rd.Messages) > 0 {
-			_, origCtx, _ := VerifyBFTMessageSignature(rd.Messages[0], node.nodePubKeys[1])
-			cCtx, _ := decodeBFTContext(origCtx)
+			_, origCtx, err := VerifyBFTMessageSignature(rd.Messages[0], node.nodePubKeys[2])
+			require.NoError(t, err)
+			cCtx, err := decodeBFTContext(origCtx)
+			require.NoError(t, err)
 			require.NotEqual(t, PhaseCommit, cCtx.Phase, "Node emitted Commit without reaching Quorum!")
 		}
 	case <-time.After(50 * time.Millisecond):
@@ -233,7 +352,13 @@ func TestBFT_Client_ConsensusQuorum(t *testing.T) {
 	}
 	require.NotZero(t, reqTs, "Request timestamp should be captured")
 
-	bctx := BFTContext{Phase: PhaseReply, Result: []byte("success")}
+	bctx := BFTContext{
+		Phase:            PhaseReply,
+		View:             0,
+		RequestTimestamp: reqTs,
+		ClientID:         100,
+		Result:           []byte("OK"),
+	}
 	encCtx, _ := encodeBFTContext(bctx)
 
 	generateReply := func(nodeID uint64) *pb.Message {
@@ -257,7 +382,7 @@ func TestBFT_Client_ConsensusQuorum(t *testing.T) {
 	require.Empty(t, client.pending)
 
 	result := <-client.ConsensusC
-	require.Equal(t, []byte("success"), result)
+	require.Equal(t, []byte("OK"), result)
 }
 
 // Integration Test w/ Real etcd Raft Node and Asynchronous Consumer
@@ -385,7 +510,14 @@ WaitLeader:
 	}
 
 	// 4. Inject 2x Peer PhasePrepares
-	bctx := BFTContext{Phase: PhasePrepare, View: 0, SeqNum: 1, Digest: hashData(payloadData)}
+	digest := entryDigest(t, payloadData)
+
+	bctx := BFTContext{
+		Phase:  PhasePrepare,
+		View:   0,
+		SeqNum: 1,
+		Digest: digest,
+	}
 	encPCtx, _ := encodeBFTContext(bctx)
 	for i := uint64(2); i <= 3; i++ {
 		pMsg := &pb.Message{Type: pb.MsgApp.Enum(), From: u64p(i), Term: u64p(1), Context: encPCtx}
