@@ -34,10 +34,10 @@ import (
 // }
 
 type Checkpoint struct {
-	SeqNum  uint64
-	Digest  [32]byte
-	Replica uint64
-	Sig     []byte
+	SeqNum   uint64
+	Digest   [32]byte
+	Replica  uint64
+	MsgBytes []byte // signed CHECKPOINT message
 }
 
 type StableCheckpoint struct {
@@ -77,7 +77,7 @@ func (r bftLogRecord) logSeq() uint64 {
 
 func newLogRecordFromMessage(m *pb.Message, bctx BFTContext) bftLogRecord {
 	ctxBytes, _ := encodeBFTContext(bctx)
-	msgBytes, _ := proto.Marshal(m)
+	msgBytes, _ := marshalSignedMessage(m)
 	return bftLogRecord{
 		phase:         bctx.Phase,
 		view:          bctx.View,
@@ -279,8 +279,27 @@ func WrapBFTNode(
 	return bn
 }
 
+func (bn *BFTNode) signMessage(m *pb.Message) error {
+	return signMessageWithKey(m, bn.priv, bn.cfg.now)
+}
+
+// signedWireCopy returns a signed clone with optional recipient set in To.
+func (bn *BFTNode) signedWireCopy(m *pb.Message, to uint64) (*pb.Message, error) {
+	cp := proto.Clone(m).(*pb.Message)
+	if to != 0 {
+		cp.To = new(uint64(to))
+	}
+	if err := bn.signMessage(cp); err != nil {
+		return nil, err
+	}
+	return cp, nil
+}
+
 func (bn *BFTNode) signOutboundMessages(msgs []*pb.Message) {
 	for i := range msgs {
+		if hasPackedSignature(msgs[i].Context) {
+			continue
+		}
 		ts := bn.cfg.now().UnixNano()
 		origCtx := normalizeContext(msgs[i].Context)
 		dataSign, err := messageSignBytes(msgs[i], origCtx, ts)
@@ -362,6 +381,8 @@ func (bn *BFTNode) Step(ctx context.Context, m *pb.Message) error {
 		return bn.Node.Step(ctx, m)
 	}
 
+	signedForLog := cloneSignedMessage(m)
+
 	if err := bn.verifyMessage(m); err != nil {
 		return err
 	}
@@ -390,7 +411,12 @@ func (bn *BFTNode) Step(ctx context.Context, m *pb.Message) error {
 			}
 			bn.prepares[key][bn.selfID] = struct{}{}
 
-			bn.appendLogPrePrepare(ppMsg, bctx)
+			localPP, err := bn.signedWireCopy(ppMsg, bn.selfID)
+			if err != nil {
+				bn.mu.Unlock()
+				return err
+			}
+			bn.appendLogPrePrepare(localPP, bctx)
 			bn.broadcast(ppMsg)
 		}
 		bn.mu.Unlock()
@@ -410,8 +436,8 @@ func (bn *BFTNode) Step(ctx context.Context, m *pb.Message) error {
 	case PhaseCheckpoint:
 		seq := bctx.CheckpointSeqNum
 		dig := bctx.CheckpointDigest
-		bn.appendLogCheckpoint(m, bctx)
-		bn.acceptCheckpoint(seq, dig, m.GetFrom())
+		bn.appendLogCheckpoint(signedForLog, bctx)
+		bn.acceptCheckpoint(seq, dig, m.GetFrom(), signedForLog)
 		bn.mu.Unlock()
 		return nil
 	case PhasePrePrepare:
@@ -434,7 +460,7 @@ func (bn *BFTNode) Step(ctx context.Context, m *pb.Message) error {
 			bn.reqs[key] = m.Entries
 		}
 
-		bn.appendLogPrePrepare(m, bctx)
+		bn.appendLogPrePrepare(signedForLog, bctx)
 
 		pMsg, err := bn.ConstructP(bctx)
 		if err != nil {
@@ -453,7 +479,12 @@ func (bn *BFTNode) Step(ctx context.Context, m *pb.Message) error {
 
 		pBctx := bctx
 		pBctx.Phase = PhasePrepare
-		bn.appendLogPrepare(pMsg, pBctx, bn.selfID)
+		localP, err := bn.signedWireCopy(pMsg, bn.selfID)
+		if err != nil {
+			bn.mu.Unlock()
+			return err
+		}
+		bn.appendLogPrepare(localP, pBctx, bn.selfID)
 		bn.broadcast(pMsg)
 
 		if wasBelow && isAbove {
@@ -469,7 +500,12 @@ func (bn *BFTNode) Step(ctx context.Context, m *pb.Message) error {
 			bn.commits[key][bn.selfID] = struct{}{}
 			cBctx := bctx
 			cBctx.Phase = PhaseCommit
-			bn.appendLogCommit(cMsg, cBctx, bn.selfID)
+			localC, err := bn.signedWireCopy(cMsg, bn.selfID)
+			if err != nil {
+				bn.mu.Unlock()
+				return err
+			}
+			bn.appendLogCommit(localC, cBctx, bn.selfID)
 			bn.broadcast(cMsg)
 
 			if uint64(len(bn.commits[key])) >= (2*bn.f + 1) {
@@ -482,7 +518,7 @@ func (bn *BFTNode) Step(ctx context.Context, m *pb.Message) error {
 			bn.prepares[key] = make(map[uint64]struct{})
 		}
 
-		bn.appendLogPrepare(m, bctx, m.GetFrom())
+		bn.appendLogPrepare(signedForLog, bctx, m.GetFrom())
 
 		wasBelow := uint64(len(bn.prepares[key])) < (2*bn.f + 1)
 		bn.prepares[key][m.GetFrom()] = struct{}{}
@@ -501,7 +537,12 @@ func (bn *BFTNode) Step(ctx context.Context, m *pb.Message) error {
 			bn.commits[key][bn.selfID] = struct{}{}
 			cBctx := bctx
 			cBctx.Phase = PhaseCommit
-			bn.appendLogCommit(cMsg, cBctx, bn.selfID)
+			localC, err := bn.signedWireCopy(cMsg, bn.selfID)
+			if err != nil {
+				bn.mu.Unlock()
+				return err
+			}
+			bn.appendLogCommit(localC, cBctx, bn.selfID)
 			bn.broadcast(cMsg)
 
 			if uint64(len(bn.commits[key])) >= (2*bn.f + 1) {
@@ -514,7 +555,7 @@ func (bn *BFTNode) Step(ctx context.Context, m *pb.Message) error {
 			bn.commits[key] = make(map[uint64]struct{})
 		}
 
-		bn.appendLogCommit(m, bctx, m.GetFrom())
+		bn.appendLogCommit(signedForLog, bctx, m.GetFrom())
 
 		wasBelow := uint64(len(bn.commits[key])) < (2*bn.f + 1)
 		bn.commits[key][m.GetFrom()] = struct{}{}
@@ -690,7 +731,8 @@ func (bn *BFTNode) localCheckpointDigest(seq uint64) ([32]byte, bool) {
 	return bn.stateDigestAt(seq), true
 }
 
-func (bn *BFTNode) recordCheckpoint(seq uint64, dig [32]byte, replica uint64) {
+func (bn *BFTNode) recordCheckpoint(seq uint64, dig [32]byte, replica uint64, signedMsg *pb.Message) {
+	msgBytes, _ := marshalSignedMessage(signedMsg)
 	if bn.checkpoints[seq] == nil {
 		bn.checkpoints[seq] = make(map[[32]byte]map[uint64]*Checkpoint)
 	}
@@ -698,9 +740,10 @@ func (bn *BFTNode) recordCheckpoint(seq uint64, dig [32]byte, replica uint64) {
 		bn.checkpoints[seq][dig] = make(map[uint64]*Checkpoint)
 	}
 	bn.checkpoints[seq][dig][replica] = &Checkpoint{
-		SeqNum:  seq,
-		Digest:  dig,
-		Replica: replica,
+		SeqNum:   seq,
+		Digest:   dig,
+		Replica:  replica,
+		MsgBytes: msgBytes,
 	}
 }
 
@@ -822,12 +865,12 @@ func (bn *BFTNode) MessageLogLen() int {
 // acceptCheckpoint records a peer checkpoint only if this replica has executed
 // through seq and agrees on the state digest. Stabilization requires 2f+1 such
 // proofs (at least f+1 non-faulty replicas in the f < n/3 model).
-func (bn *BFTNode) acceptCheckpoint(seq uint64, dig [32]byte, replica uint64) {
+func (bn *BFTNode) acceptCheckpoint(seq uint64, dig [32]byte, replica uint64, signedMsg *pb.Message) {
 	localDig, ok := bn.localCheckpointDigest(seq)
 	if !ok || localDig != dig {
 		return
 	}
-	bn.recordCheckpoint(seq, dig, replica)
+	bn.recordCheckpoint(seq, dig, replica, signedMsg)
 	if uint64(len(bn.checkpoints[seq][dig])) >= 2*bn.f+1 {
 		bn.stabilizeCheckpoint(seq, dig)
 	}
@@ -848,8 +891,6 @@ func (bn *BFTNode) constructCheckpointIfNeeded(seq uint64) {
 		return
 	}
 
-	bn.recordCheckpoint(seq, dig, bn.selfID)
-
 	cpMsg, err := bn.ConstructCheckpoint(seq, dig)
 	if err != nil {
 		return
@@ -862,7 +903,12 @@ func (bn *BFTNode) constructCheckpointIfNeeded(seq uint64) {
 		CheckpointSeqNum: seq,
 		CheckpointDigest: dig,
 	}
-	bn.appendLogCheckpoint(cpMsg, cpBctx)
+	localCP, err := bn.signedWireCopy(cpMsg, bn.selfID)
+	if err != nil {
+		return
+	}
+	bn.appendLogCheckpoint(localCP, cpBctx)
+	bn.recordCheckpoint(seq, dig, bn.selfID, localCP)
 	bn.broadcast(cpMsg)
 
 	if uint64(len(bn.checkpoints[seq][dig])) >= 2*bn.f+1 {
@@ -880,11 +926,12 @@ func (bn *BFTNode) stabilizeCheckpoint(seq uint64, dig [32]byte) {
 	}
 
 	proofs := make([]BFTCheckpointProof, 0, len(bn.checkpoints[seq][dig]))
-	for replica := range bn.checkpoints[seq][dig] {
+	for replica, cp := range bn.checkpoints[seq][dig] {
 		proofs = append(proofs, BFTCheckpointProof{
 			ReplicaID: replica,
 			SeqNum:    seq,
 			Digest:    dig,
+			MsgBytes:  append([]byte(nil), cp.MsgBytes...),
 		})
 	}
 
@@ -910,7 +957,15 @@ func (bn *BFTNode) StableCheckpoint() *StableCheckpoint {
 		return nil
 	}
 	sc := *bn.stableCheckpoint
-	sc.Proofs = append([]BFTCheckpointProof(nil), bn.stableCheckpoint.Proofs...)
+	sc.Proofs = make([]BFTCheckpointProof, len(bn.stableCheckpoint.Proofs))
+	for i, p := range bn.stableCheckpoint.Proofs {
+		sc.Proofs[i] = BFTCheckpointProof{
+			ReplicaID: p.ReplicaID,
+			SeqNum:    p.SeqNum,
+			Digest:    p.Digest,
+			MsgBytes:  append([]byte(nil), p.MsgBytes...),
+		}
+	}
 	return &sc
 }
 
@@ -936,9 +991,11 @@ func (bn *BFTNode) broadcast(m *pb.Message) {
 		if id == bn.selfID {
 			continue
 		}
-		mCopy := proto.Clone(m).(*pb.Message)
-		mCopy.To = new(uint64(id))
-		bn.bftMsgs = append(bn.bftMsgs, mCopy)
+		signed, err := bn.signedWireCopy(m, id)
+		if err != nil {
+			continue
+		}
+		bn.bftMsgs = append(bn.bftMsgs, signed)
 	}
 }
 

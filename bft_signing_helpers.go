@@ -77,6 +77,36 @@ func normalizeContext(ctx []byte) []byte {
 	return append([]byte(nil), ctx...)
 }
 
+func hasPackedSignature(ctx []byte) bool {
+	return len(ctx) >= len(sigMagic) && string(ctx[:len(sigMagic)]) == sigMagic
+}
+
+func cloneSignedMessage(m *pb.Message) *pb.Message {
+	if m == nil {
+		return nil
+	}
+	return proto.Clone(m).(*pb.Message)
+}
+
+func signMessageWithKey(m *pb.Message, priv ed25519.PrivateKey, now func() time.Time) error {
+	if hasPackedSignature(m.Context) {
+		return nil
+	}
+	ts := now().UnixNano()
+	origCtx := normalizeContext(m.Context)
+	dataSign, err := messageSignBytes(m, origCtx, ts)
+	if err != nil {
+		return err
+	}
+	sig := ed25519.Sign(priv, dataSign)
+	m.Context = packSignature(sig, ts, origCtx)
+	return nil
+}
+
+func marshalSignedMessage(m *pb.Message) ([]byte, error) {
+	return proto.Marshal(m)
+}
+
 // messageSignBytes produces the byte slice that should be signed for a given message and timestamp.
 func messageSignBytes(m *pb.Message, origCtx []byte, ts int64) ([]byte, error) {
 	clone := proto.Clone(m).(*pb.Message)

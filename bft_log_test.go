@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"testing"
 
+	"github.com/golang/protobuf/proto"
 	"github.com/stretchr/testify/require"
 	pb "go.etcd.io/raft/v3/raftpb"
 )
@@ -149,6 +150,14 @@ func TestBFTLog_StableProofRetainedAfterCheckpoint(t *testing.T) {
 		if rec.stableProof && rec.checkpointSeq == 100 {
 			foundProof = true
 			require.Len(t, rec.stableProofs, 3)
+			for _, proof := range rec.stableProofs {
+				require.NotEmpty(t, proof.MsgBytes)
+				var cpMsg pb.Message
+				require.NoError(t, proto.Unmarshal(proof.MsgBytes, &cpMsg))
+				pub := f.nodePrivs[proof.ReplicaID].Public().(ed25519.PublicKey)
+				_, _, err := VerifyBFTMessageSignature(&cpMsg, pub)
+				require.NoError(t, err)
+			}
 		}
 		if rec.logSeq() <= 100 && !rec.stableProof {
 			t.Fatalf("expected log records at or below stable seq to be truncated, found seq %d phase %v", rec.logSeq(), rec.phase)

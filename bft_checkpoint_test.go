@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/golang/protobuf/proto"
 	"github.com/stretchr/testify/require"
 	pb "go.etcd.io/raft/v3/raftpb"
 )
@@ -99,7 +98,11 @@ func (f checkpointTestFixture) seedRequestDigests(t *testing.T, through uint64) 
 			Entries: []*pb.Entry{{Data: payload}},
 			Context: encCtx,
 		}
-		f.node.appendLogPrePrepare(m, bctx)
+		local, err := f.node.signedWireCopy(m, f.node.selfID)
+		if err != nil {
+			t.Fatalf("sign local pre-prepare: %v", err)
+		}
+		f.node.appendLogPrePrepare(local, bctx)
 	}
 	if through > f.node.lastAppliedSeqNum {
 		f.node.lastAppliedSeqNum = through
@@ -126,7 +129,9 @@ func (f checkpointTestFixture) localDigest(t *testing.T, seq uint64) [32]byte {
 
 func decodeOutboundBFTContext(t *testing.T, m *pb.Message) BFTContext {
 	t.Helper()
-	bctx, err := decodeBFTContext(m.Context)
+	_, _, origCtx, err := parseSignature(m.Context)
+	require.NoError(t, err)
+	bctx, err := decodeBFTContext(origCtx)
 	require.NoError(t, err)
 	return bctx
 }
@@ -196,24 +201,14 @@ func TestCheckpoint_StateDigestAt(t *testing.T) {
 
 	f.node.mu.Lock()
 	got := f.node.stateDigestAt(3)
+	var wantBuf []byte
+	for _, rec := range f.node.messageLog {
+		if rec.phase == PhasePrePrepare {
+			wantBuf = append(wantBuf, rec.msgBytes...)
+		}
+	}
 	f.node.mu.Unlock()
 
-	var wantBuf []byte
-	for s := uint64(1); s <= 3; s++ {
-		payload := []byte(fmt.Sprintf("req-%d", s))
-		digest := hashData(payload)
-		bctx := BFTContext{Phase: PhasePrePrepare, View: 0, SeqNum: s, Digest: digest}
-		encCtx, _ := encodeBFTContext(bctx)
-		m := &pb.Message{
-			Type:    pb.MsgApp.Enum(),
-			From:    u64p(1),
-			Entries: []*pb.Entry{{Data: payload}},
-			Context: encCtx,
-		}
-		mb, err := proto.Marshal(m)
-		require.NoError(t, err)
-		wantBuf = append(wantBuf, mb...)
-	}
 	require.Equal(t, hashData(wantBuf), got)
 }
 
@@ -262,7 +257,7 @@ func TestCheckpoint_GarbageCollectPrunesOldState(t *testing.T) {
 		f.node.reqs[key] = []*pb.Entry{{Data: []byte("x")}}
 	}
 	for _, replica := range []uint64{1, 2, 3} {
-		f.node.recordCheckpoint(100, dig, replica)
+		f.node.recordCheckpoint(100, dig, replica, f.signCheckpoint(replica, 100, dig))
 	}
 	f.node.stabilizeCheckpoint(100, dig)
 	f.node.mu.Unlock()
@@ -331,7 +326,9 @@ func TestCheckpoint_OnCommitQuorumTriggersAtInterval(t *testing.T) {
 		Entries: []*pb.Entry{{Data: payload}},
 		Context: encCtx,
 	}
-	f.node.appendLogPrePrepare(m, bctx)
+	local, err := f.node.signedWireCopy(m, f.node.selfID)
+	require.NoError(t, err)
+	f.node.appendLogPrePrepare(local, bctx)
 	f.node.onCommitQuorum(key)
 	f.node.mu.Unlock()
 

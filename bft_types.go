@@ -22,17 +22,19 @@ const (
 	PhaseReply
 )
 
-// BFTCheckpointProof captures one checkpoint proof.
+// BFTCheckpointProof captures one signed CHECKPOINT message proof.
 type BFTCheckpointProof struct {
 	ReplicaID uint64
 	SeqNum    uint64
-	Digest    [32]byte // of state hash
+	Digest    [32]byte
+	MsgBytes  []byte // proto.Marshal of the signed CHECKPOINT pb.Message
 }
 // BFTPreparedProof captures one prepared request proof Pm in a view-change.
 type BFTPreparedProof struct {
-	View   uint64
-	SeqNum uint64
-	Digest [32]byte
+	View     uint64
+	SeqNum   uint64
+	Digest   [32]byte
+	MsgBytes []byte // proto.Marshal of the signed PREPARE/COMMIT pb.Message
 }
 
 // BFTPrePrepareMeta captures one pre-prepare metadata item in a new-view O set.

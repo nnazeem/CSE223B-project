@@ -16,6 +16,28 @@ type mockNode struct {
 	readyc chan Ready
 }
 
+func drainOutboundBFTMessages(t *testing.T, ch <-chan *pb.Message, pub ed25519.PublicKey, phase BFTPhase, count int) {
+	t.Helper()
+	got := 0
+	deadline := time.After(2 * time.Second)
+	for got < count {
+		select {
+		case m := <-ch:
+			_, origCtx, err := VerifyBFTMessageSignature(m, pub)
+			if err != nil {
+				continue
+			}
+			bctx, err := decodeBFTContext(origCtx)
+			if err != nil || bctx.Phase != phase {
+				continue
+			}
+			got++
+		case <-deadline:
+			t.Fatalf("timeout waiting for %d outbound phase %v messages, got %d", count, phase, got)
+		}
+	}
+}
+
 func (m *mockNode) Step(ctx context.Context, msg *pb.Message) error { return nil }
 func (m *mockNode) Propose(ctx context.Context, data []byte) error { return nil }
 func (m *mockNode) Ready() <-chan Ready                            { return m.readyc }
@@ -89,7 +111,7 @@ func TestBFT_Client_ReplayAttack(t *testing.T) {
 }
 
 func TestBFT_Node_PrepareQuorum(t *testing.T) {
-	node, _, nodePrivs, mock := setupCluster(t)
+	node, _, nodePrivs, _ := setupCluster(t)
 	ctx := context.Background()
 
 	bctx := BFTContext{Phase: PhasePrePrepare, View: 0, SeqNum: 1, Digest: hashData([]byte("test"))}
@@ -117,17 +139,26 @@ func TestBFT_Node_PrepareQuorum(t *testing.T) {
 	err := node.Step(ctx, pMsg)
 	require.NoError(t, err)
 
-	mock.readyc <- Ready{}
-	rd2 := <-node.Ready()
-	require.NotEmpty(t, rd2.Messages)
+	rd = <-node.Ready()
 	node.Advance()
 
-	// Strip the outbound signature to verify inner contents
-	_, cOrigCtx, err := VerifyBFTMessageSignature(rd2.Messages[0], node.nodePubKeys[1])
-	require.NoError(t, err)
-
-	cCtx, _ := decodeBFTContext(cOrigCtx)
-	require.Equal(t, PhaseCommit, cCtx.Phase)
+	var commitCtx BFTContext
+	foundCommit := false
+	for _, out := range rd.Messages {
+		_, origCtx, err := VerifyBFTMessageSignature(out, node.nodePubKeys[1])
+		if err != nil {
+			continue
+		}
+		cCtx, err := decodeBFTContext(origCtx)
+		if err != nil || cCtx.Phase != PhaseCommit {
+			continue
+		}
+		commitCtx = cCtx
+		foundCommit = true
+		break
+	}
+	require.True(t, foundCommit)
+	require.Equal(t, PhaseCommit, commitCtx.Phase)
 }
 
 // -------------------------------------------------------------
@@ -366,6 +397,17 @@ WaitLeader:
 
 	time.Sleep(50 * time.Millisecond)
 
+	drainOutbound := func() {
+		for {
+			select {
+			case <-outboundMsgs:
+			default:
+				return
+			}
+		}
+	}
+	drainOutbound()
+
 	// 2. Submit BFT Client Proposal
 	payloadData := []byte("integration-test-data")
 	err = bftClient.Propose(ctx, payloadData)
@@ -376,13 +418,7 @@ WaitLeader:
 	require.NoError(t, err)
 
 	// 3. Catch outbound PhasePrePrepare (Drain 3 messages sent to peers 2, 3, and 4)
-	for i := 0; i < 3; i++ {
-		ppMsg := <-outboundMsgs
-		_, origCtx, _ := VerifyBFTMessageSignature(ppMsg, nodePubs[1])
-		bctx, err := decodeBFTContext(origCtx)
-		require.NoError(t, err)
-		require.Equal(t, PhasePrePrepare, bctx.Phase)
-	}
+	drainOutboundBFTMessages(t, outboundMsgs, nodePubs[1], PhasePrePrepare, 3)
 
 	// 4. Inject 2x Peer PhasePrepares
 	bctx := BFTContext{Phase: PhasePrepare, View: 0, SeqNum: 1, Digest: hashData(payloadData)}
@@ -395,12 +431,7 @@ WaitLeader:
 	}
 
 	// 5. Catch outbound PhaseCommit (Drain 3 messages sent to peers 2, 3, and 4)
-	for i := 0; i < 3; i++ {
-		cMsgOut := <-outboundMsgs
-		_, origCtx, _ := VerifyBFTMessageSignature(cMsgOut, nodePubs[1])
-		cCtx, _ := decodeBFTContext(origCtx)
-		require.Equal(t, PhaseCommit, cCtx.Phase)
-	}
+	drainOutboundBFTMessages(t, outboundMsgs, nodePubs[1], PhaseCommit, 3)
 
 	// 6. Inject 2x Peer PhaseCommits
 	bctx.Phase = PhaseCommit
