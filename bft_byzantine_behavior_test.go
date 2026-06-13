@@ -692,3 +692,215 @@ func TestBFTByzantine_PrimaryCannotMakeHonestReplicaCommitOutOfOrder(t *testing.
 	require.Equal(t, digestTwo, target.pp[seqTwoKey], "replica may remember the accepted seq=2 digest while waiting for seq=1")
 	require.Contains(t, target.commits, seqTwoKey, "replica may buffer the seq=2 commit certificate, but must not execute it out of order")
 }
+
+func TestBFTByzantine_NonPrimaryCannotCauseAcceptanceByAnsweringPhasesWithoutLocalLog(t *testing.T) {
+	fx := newBFTNetworkFixture(t)
+	target := fx.nodes[4]
+	faultyID := uint64(3)
+	seq := uint64(1)
+	key := bftSeqKey{view: 0, seq: seq}
+	clientID := uint64(100)
+	payload := []byte("request-faulty-backup-answers-without-local-log")
+
+	require.NoError(t, fx.client.Propose(fx.ctx, payload))
+	var requestTS int64
+	for ts := range fx.client.pending {
+		requestTS = ts
+	}
+	require.NotZero(t, requestTS)
+
+	// The honest target receives a valid PRE-PREPARE from the primary. The faulty
+	// non-primary does not receive the PRE-PREPARE and therefore has no local PBFT
+	// state/log entry for this sequence, but it will still try to answer later
+	// phases as if it had participated correctly.
+	pp, digest := makePrePrepareForNetworkTest(t, fx, 1, seq, payload, requestTS, clientID)
+	pp.To = u64p(target.selfID)
+	signTestNodeMessage(t, pp, fx.nodePrivs[1], 60_100)
+	require.NoError(t, target.Step(fx.ctx, pp))
+	_ = drainNodeReadyMessages(t, target)
+
+	require.NotContains(t, fx.nodes[faultyID].pp, key)
+	require.NotContains(t, fx.nodes[faultyID].reqs, key)
+	require.NotContains(t, fx.nodes[faultyID].commits, key)
+	require.NotContains(t, fx.nodes[faultyID].log, seq)
+
+	// The faulty non-primary sends PREPARE without ever accepting/appending the
+	// request locally. A single faulty phase response may help the honest target
+	// reach the prepared threshold, but it must not by itself execute the entry or
+	// create a client-visible result.
+	faultyPrepare := makePhaseMessageForNetworkTest(t, PhasePrepare, faultyID, seq, digest)
+	faultyPrepare.To = u64p(target.selfID)
+	signTestNodeMessage(t, faultyPrepare, fx.nodePrivs[faultyID], 60_200)
+	require.NoError(t, target.Step(fx.ctx, faultyPrepare))
+	_ = drainNodeReadyIfAny(t, target)
+
+	require.NotContains(t, target.log, seq)
+	require.NotContains(t, fx.nodes[faultyID].log, seq)
+
+	// The same faulty non-primary then sends COMMIT, still without having accepted
+	// or executed the request locally. The honest target has at most its own COMMIT
+	// plus the faulty COMMIT, which is below the 2f+1 commit threshold for n=4.
+	faultyCommit := makePhaseMessageForNetworkTest(t, PhaseCommit, faultyID, seq, digest)
+	faultyCommit.To = u64p(target.selfID)
+	signTestNodeMessage(t, faultyCommit, fx.nodePrivs[faultyID], 60_300)
+	require.NoError(t, target.Step(fx.ctx, faultyCommit))
+	_ = drainNodeReadyIfAny(t, target)
+
+	require.Contains(t, target.pp, key)
+	require.Contains(t, target.prepares, key)
+	require.Contains(t, target.commits, key)
+	require.Less(t, uint64(len(target.commits[key])), 2*target.f+1)
+	require.NotContains(t, target.log, seq, "faulty non-primary phase messages must not execute the entry without commit quorum")
+	require.NotContains(t, fx.nodes[faultyID].log, seq, "faulty sender never appended/executed the entry locally")
+
+	// Even if the faulty non-primary lies to the client with a syntactically valid
+	// REPLY for the request timestamp, the client must not accept one reply from a
+	// replica that did not go through the full PBFT replication path.
+	byzReply := makeClientReplyForByzantineTest(
+		t,
+		faultyID,
+		fx.client.selfID,
+		requestTS,
+		fx.client.selfID,
+		[]byte("OK"),
+		fx.nodePrivs[faultyID],
+		60_400,
+	)
+	require.NoError(t, fx.client.Step(fx.ctx, byzReply))
+
+	select {
+	case result := <-fx.client.ConsensusC:
+		t.Fatalf("client accepted a faulty non-primary reply without full PBFT replication: %q", string(result))
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	require.NotContains(t, target.log, seq)
+	require.NotContains(t, fx.nodes[faultyID].log, seq)
+}
+
+func TestBFTByzantine_NonPrimaryCannotProposeClientRequestAsPrePrepare(t *testing.T) {
+	fx := newBFTNetworkFixture(t)
+	target := fx.nodes[4]
+	nonPrimaryID := uint64(2)
+	seq := uint64(1)
+	clientID := uint64(100)
+	payload := []byte("non-primary-tries-to-propose")
+
+	reqTS := time.Now().UnixNano()
+	clientReq := signClientRequestForTest(t, clientID, 1, payload, fx.client.priv, reqTS)
+	digest, err := hashEntryBatch(clientReq.GetEntries())
+	require.NoError(t, err)
+
+	// Node 2 is a backup in view 0. It tries to behave like the primary by
+	// sending a PRE-PREPARE for a valid client request. Even though the embedded
+	// client request and digest are valid, honest replicas must reject it because
+	// only primaryForView(0) == node 1 may propose PRE-PREPARE messages.
+	bctx := BFTContext{
+		Phase:            PhasePrePrepare,
+		View:             0,
+		SeqNum:           seq,
+		Digest:           digest,
+		RequestTimestamp: reqTS,
+		ClientID:         clientID,
+		ClientRequest:    *proto.Clone(clientReq).(*pb.Message),
+	}
+	encCtx, err := encodeBFTContext(bctx)
+	require.NoError(t, err)
+
+	ppFromBackup := &pb.Message{
+		Type:    pb.MsgApp.Enum(),
+		From:    u64p(nonPrimaryID),
+		To:      u64p(target.selfID),
+		Context: encCtx,
+		Entries: cloneEntries(clientReq.GetEntries()),
+	}
+	signTestNodeMessage(t, ppFromBackup, fx.nodePrivs[nonPrimaryID], reqTS+1)
+
+	err = target.Step(fx.ctx, ppFromBackup)
+	require.ErrorContains(t, err, "pre-prepare from non-primary")
+
+	key := bftSeqKey{view: 0, seq: seq}
+	require.NotContains(t, target.pp, key)
+	require.NotContains(t, target.reqs, key)
+	require.NotContains(t, target.prepares, key)
+	require.NotContains(t, target.commits, key)
+	require.NotContains(t, target.log, seq)
+	require.Empty(t, drainNodeReadyIfAny(t, target), "honest replica must not broadcast PREPARE for a non-primary PRE-PREPARE")
+}
+
+func TestBFTByzantine_SingleReplicaCannotForceViewChangeBySpammingViewChanges(t *testing.T) {
+	fx := newBFTNetworkFixture(t)
+	target := fx.nodes[3]
+	faultyID := uint64(2)
+
+	require.Equal(t, uint64(0), target.view)
+	require.Equal(t, Normal, target.nodePhase)
+
+	// A single Byzantine replica repeatedly asks for higher views. This must not
+	// be treated as f+1 distinct replicas requesting a view change. For n=4,
+	// f=1, an honest replica should require at least f+1 == 2 distinct replicas
+	// before it leaves Normal because of observed VIEW-CHANGE traffic.
+	for newView := uint64(1); newView <= 5; newView++ {
+		vc := makeSignedViewChangeForByzantineTest(t, fx, faultyID, newView, int64(70_000+newView))
+		err := target.Step(fx.ctx, proto.Clone(&vc).(*pb.Message))
+		require.NoError(t, err)
+
+		require.Equal(t, uint64(0), target.view, "one faulty replica must not advance the local view")
+		require.Equal(t, Normal, target.nodePhase, "one faulty replica must not force the node into view-change mode")
+		require.Empty(t, drainNodeReadyIfAny(t, target), "one faulty replica must not cause outbound VIEW-CHANGE traffic")
+	}
+
+	// The node may remember the spammed VIEW-CHANGE messages, but each view should
+	// contain evidence from only the same single faulty replica, never a quorum.
+	for newView := uint64(1); newView <= 5; newView++ {
+		require.Len(t, target.vc[newView], 1)
+		require.Contains(t, target.vc[newView], faultyID)
+	}
+}
+
+func TestBFTByzantine_DuplicateViewChangeSpamFromSameReplicaDoesNotCountAsQuorum(t *testing.T) {
+	fx := newBFTNetworkFixture(t)
+	target := fx.nodes[3]
+	faultyID := uint64(2)
+	newView := uint64(1)
+
+	for i := int64(0); i < 5; i++ {
+		vc := makeSignedViewChangeForByzantineTest(t, fx, faultyID, newView, 80_000+i)
+		err := target.Step(fx.ctx, proto.Clone(&vc).(*pb.Message))
+		require.NoError(t, err)
+
+		require.Equal(t, uint64(0), target.view)
+		require.Equal(t, Normal, target.nodePhase)
+		require.Len(t, target.vc[newView], 1)
+		require.Contains(t, target.vc[newView], faultyID)
+		require.Empty(t, drainNodeReadyIfAny(t, target))
+	}
+}
+
+func TestBFTByzantine_SingleReplicaCannotRatchetViewsUpward(t *testing.T) {
+	fx := newBFTNetworkFixture(t)
+	target := fx.nodes[3]
+	faultyID := uint64(2)
+
+	requestedViews := []uint64{1, 2, 5, 10, 25, 100, 1_000}
+
+	require.Equal(t, uint64(0), target.view)
+	require.Equal(t, uint64(0), target.campaign_view)
+	require.Equal(t, Normal, target.nodePhase)
+
+	for i, newView := range requestedViews {
+		vc := makeSignedViewChangeForByzantineTest(t, fx, faultyID, newView, int64(90_000+i))
+		err := target.Step(fx.ctx, proto.Clone(&vc).(*pb.Message))
+		require.NoError(t, err)
+
+		require.Equal(t, uint64(0), target.view, "single faulty replica must not advance local view to %d", newView)
+		require.Equal(t, uint64(0), target.campaign_view, "single faulty replica must not ratchet campaign view to %d", newView)
+		require.Equal(t, Normal, target.nodePhase, "single faulty replica must not force view-change mode for view %d", newView)
+		require.Empty(t, drainNodeReadyIfAny(t, target), "single faulty replica must not cause outbound view-change traffic for view %d", newView)
+	}
+
+	for _, newView := range requestedViews {
+		require.Len(t, target.vc[newView], 1)
+		require.Contains(t, target.vc[newView], faultyID)
+	}
+}

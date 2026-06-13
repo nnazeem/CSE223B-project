@@ -8,33 +8,38 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-func countMessagesAfterAndMinKey(
+func earliestViewWithReplicaQuorum(
 	msgs map[uint64]map[uint64]*pb.Message,
-	minFirstKey uint64,
-) (count int, minKey uint64, ok bool) {
-	for firstKey, inner := range msgs {
-		if firstKey <= minFirstKey {
+	currentView uint64,
+	quorum uint64,
+) (view uint64, ok bool) {
+	if quorum == 0 {
+		return 0, false
+	}
+
+	for candidateView, byReplica := range msgs {
+		if candidateView <= currentView {
 			continue
 		}
 
-		localCount := 0
-		for _, msg := range inner {
+		var distinct uint64
+		for _, msg := range byReplica {
 			if msg != nil {
-				localCount++
+				distinct++
 			}
 		}
-		if localCount == 0 {
+
+		if distinct < quorum {
 			continue
 		}
 
-		count += localCount
-		if !ok || firstKey < minKey {
-			minKey = firstKey
+		if !ok || candidateView < view {
+			view = candidateView
 			ok = true
 		}
 	}
 
-	return count, minKey, ok
+	return view, ok
 }
 
 func MapValues[K comparable, V any](m map[K]*V) []V {

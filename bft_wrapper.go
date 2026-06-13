@@ -682,8 +682,8 @@ func (bn *BFTNode) Step(ctx context.Context, m *pb.Message) error {
 		}
 		bn.vc[bctx.View][signedMsg.GetFrom()] = signedMsg
 
-		count, minView, ok := countMessagesAfterAndMinKey(bn.vc, bn.view)
-		if ok && uint64(count) >= bn.f+1 && bn.campaign_view < minView {
+		minView, ok := earliestViewWithReplicaQuorum(bn.vc, bn.view, bn.f+1)
+		if ok && bn.campaign_view < minView {
 			if err := bn.TriggerViewChange(minView); err != nil {
 				bn.mu.Unlock()
 				return err
