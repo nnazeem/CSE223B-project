@@ -552,6 +552,7 @@ func (rn *RawNode) ForgetLeader() error {
 // Read State has a read index. Once the application advances further than the read
 // index, any linearizable read requests issued before the read request can be
 // processed safely. The read state will have the same rctx attached.
+// See (Node).ReadIndex for more details.
 func (rn *RawNode) ReadIndex(rctx []byte) {
 	_ = rn.raft.Step(&pb.Message{Type: pb.MsgReadIndex.Enum(), Entries: []*pb.Entry{{Data: rctx}}})
 }
