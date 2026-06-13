@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/golang/protobuf/proto"
 	"github.com/stretchr/testify/require"
 	pb "go.etcd.io/raft/v3/raftpb"
 )
@@ -86,8 +87,22 @@ func (f checkpointTestFixture) seedRequestDigests(t *testing.T, through uint64) 
 	f.node.mu.Lock()
 	defer f.node.mu.Unlock()
 	for s := uint64(1); s <= through; s++ {
+		payload := []byte(fmt.Sprintf("req-%d", s))
+		digest := hashData(payload)
 		key := bftSeqKey{view: 0, seq: s}
-		f.node.pp[key] = hashData([]byte(fmt.Sprintf("req-%d", s)))
+		f.node.pp[key] = digest
+		bctx := BFTContext{Phase: PhasePrePrepare, View: 0, SeqNum: s, Digest: digest}
+		encCtx, _ := encodeBFTContext(bctx)
+		m := &pb.Message{
+			Type:    pb.MsgApp.Enum(),
+			From:    u64p(1),
+			Entries: []*pb.Entry{{Data: payload}},
+			Context: encCtx,
+		}
+		f.node.appendLogPrePrepare(m, bctx)
+	}
+	if through > f.node.lastAppliedSeqNum {
+		f.node.lastAppliedSeqNum = through
 	}
 }
 
@@ -185,8 +200,19 @@ func TestCheckpoint_StateDigestAt(t *testing.T) {
 
 	var wantBuf []byte
 	for s := uint64(1); s <= 3; s++ {
-		d := hashData([]byte(fmt.Sprintf("req-%d", s)))
-		wantBuf = append(wantBuf, d[:]...)
+		payload := []byte(fmt.Sprintf("req-%d", s))
+		digest := hashData(payload)
+		bctx := BFTContext{Phase: PhasePrePrepare, View: 0, SeqNum: s, Digest: digest}
+		encCtx, _ := encodeBFTContext(bctx)
+		m := &pb.Message{
+			Type:    pb.MsgApp.Enum(),
+			From:    u64p(1),
+			Entries: []*pb.Entry{{Data: payload}},
+			Context: encCtx,
+		}
+		mb, err := proto.Marshal(m)
+		require.NoError(t, err)
+		wantBuf = append(wantBuf, mb...)
 	}
 	require.Equal(t, hashData(wantBuf), got)
 }
@@ -291,14 +317,21 @@ func TestCheckpoint_OnCommitQuorumTriggersAtInterval(t *testing.T) {
 	seq := uint64(CheckpointInterval)
 	payload := []byte("batch-at-checkpoint")
 
+	f.seedRequestDigests(t, seq-1)
 	f.node.mu.Lock()
 	key := bftSeqKey{view: 0, seq: seq}
-	f.node.pp[key] = hashData(payload)
+	digest := hashData(payload)
+	f.node.pp[key] = digest
 	f.node.reqs[key] = []*pb.Entry{{Data: payload}}
-	for s := uint64(1); s < seq; s++ {
-		k := bftSeqKey{view: 0, seq: s}
-		f.node.pp[k] = hashData([]byte(fmt.Sprintf("req-%d", s)))
+	bctx := BFTContext{Phase: PhasePrePrepare, View: 0, SeqNum: seq, Digest: digest}
+	encCtx, _ := encodeBFTContext(bctx)
+	m := &pb.Message{
+		Type:    pb.MsgApp.Enum(),
+		From:    u64p(1),
+		Entries: []*pb.Entry{{Data: payload}},
+		Context: encCtx,
 	}
+	f.node.appendLogPrePrepare(m, bctx)
 	f.node.onCommitQuorum(key)
 	f.node.mu.Unlock()
 

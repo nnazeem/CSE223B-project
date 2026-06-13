@@ -52,6 +52,46 @@ type bftSeqKey struct {
 	seq  uint64
 }
 
+// bftLogRecord is one message accepted into the replica's PBFT message log.
+type bftLogRecord struct {
+	phase         BFTPhase
+	view          uint64
+	seqNum        uint64
+	digest        [32]byte
+	replica       uint64
+	msgBytes      []byte // proto.Marshal of the accepted pb.Message
+	ctxBytes      []byte
+	entries       []*pb.Entry
+	checkpointSeq uint64
+	checkpointDig [32]byte
+	stableProof   bool
+	stableProofs  []BFTCheckpointProof
+}
+
+func (r bftLogRecord) logSeq() uint64 {
+	if r.phase == PhaseCheckpoint || r.stableProof {
+		return r.checkpointSeq
+	}
+	return r.seqNum
+}
+
+func newLogRecordFromMessage(m *pb.Message, bctx BFTContext) bftLogRecord {
+	ctxBytes, _ := encodeBFTContext(bctx)
+	msgBytes, _ := proto.Marshal(m)
+	return bftLogRecord{
+		phase:         bctx.Phase,
+		view:          bctx.View,
+		seqNum:        bctx.SeqNum,
+		digest:        bctx.Digest,
+		replica:       m.GetFrom(),
+		msgBytes:      msgBytes,
+		ctxBytes:      ctxBytes,
+		entries:       cloneEntries(m.GetEntries()),
+		checkpointSeq: bctx.CheckpointSeqNum,
+		checkpointDig: bctx.CheckpointDigest,
+	}
+}
+
 // shouldSign reports whether an outbound message must be signed before delivery.
 func clientIDSet(ids []uint64) map[uint64]struct{} {
 	if len(ids) == 0 {
@@ -154,12 +194,20 @@ type BFTNode struct {
 	priv        ed25519.PrivateKey
 
 	view uint64
-	log  []*pb.Entry
 
 	pp       map[bftSeqKey][32]byte
 	prepares map[bftSeqKey]map[uint64]struct{}
 	commits  map[bftSeqKey]map[uint64]struct{}
 	reqs     map[bftSeqKey][]*pb.Entry // Buffer to hold full payloads during PBFT consensus
+
+	// PBFT message log: accepted pre-prepare / prepare / commit / checkpoint records.
+	messageLog        []bftLogRecord
+	seqNumToLogIndex  map[bftSeqKey]uint64 // first log index for (view, seq)
+	lastAppliedSeqNum uint64
+	// for deduplication of messages
+	logPrepareSeen    map[bftSeqKey]map[uint64]struct{}
+	logCommitSeen     map[bftSeqKey]map[uint64]struct{}
+	logCheckpointSeen map[uint64]map[[32]byte]map[uint64]struct{}
 
 	lowW     uint64
 	highW    uint64
@@ -205,6 +253,13 @@ func WrapBFTNode(
 		prepares: make(map[bftSeqKey]map[uint64]struct{}),
 		commits:  make(map[bftSeqKey]map[uint64]struct{}),
 		reqs:     make(map[bftSeqKey][]*pb.Entry),
+
+		messageLog:        make([]bftLogRecord, 0),
+		seqNumToLogIndex:  make(map[bftSeqKey]uint64),
+
+		logPrepareSeen:    make(map[bftSeqKey]map[uint64]struct{}),
+		logCommitSeen:     make(map[bftSeqKey]map[uint64]struct{}),
+		logCheckpointSeen: make(map[uint64]map[[32]byte]map[uint64]struct{}),
 
 		lowW:     0,
 		highW:    WatermarkWindow,
@@ -335,6 +390,7 @@ func (bn *BFTNode) Step(ctx context.Context, m *pb.Message) error {
 			}
 			bn.prepares[key][bn.selfID] = struct{}{}
 
+			bn.appendLogPrePrepare(ppMsg, bctx)
 			bn.broadcast(ppMsg)
 		}
 		bn.mu.Unlock()
@@ -354,6 +410,7 @@ func (bn *BFTNode) Step(ctx context.Context, m *pb.Message) error {
 	case PhaseCheckpoint:
 		seq := bctx.CheckpointSeqNum
 		dig := bctx.CheckpointDigest
+		bn.appendLogCheckpoint(m, bctx)
 		bn.acceptCheckpoint(seq, dig, m.GetFrom())
 		bn.mu.Unlock()
 		return nil
@@ -377,6 +434,8 @@ func (bn *BFTNode) Step(ctx context.Context, m *pb.Message) error {
 			bn.reqs[key] = m.Entries
 		}
 
+		bn.appendLogPrePrepare(m, bctx)
+
 		pMsg, err := bn.ConstructP(bctx)
 		if err != nil {
 			bn.mu.Unlock()
@@ -392,6 +451,9 @@ func (bn *BFTNode) Step(ctx context.Context, m *pb.Message) error {
 		bn.prepares[key][bn.selfID] = struct{}{} // Self-vote
 		isAbove := uint64(len(bn.prepares[key])) >= (2*bn.f + 1)
 
+		pBctx := bctx
+		pBctx.Phase = PhasePrepare
+		bn.appendLogPrepare(pMsg, pBctx, bn.selfID)
 		bn.broadcast(pMsg)
 
 		if wasBelow && isAbove {
@@ -405,6 +467,9 @@ func (bn *BFTNode) Step(ctx context.Context, m *pb.Message) error {
 				bn.commits[key] = make(map[uint64]struct{})
 			}
 			bn.commits[key][bn.selfID] = struct{}{}
+			cBctx := bctx
+			cBctx.Phase = PhaseCommit
+			bn.appendLogCommit(cMsg, cBctx, bn.selfID)
 			bn.broadcast(cMsg)
 
 			if uint64(len(bn.commits[key])) >= (2*bn.f + 1) {
@@ -416,6 +481,8 @@ func (bn *BFTNode) Step(ctx context.Context, m *pb.Message) error {
 		if bn.prepares[key] == nil {
 			bn.prepares[key] = make(map[uint64]struct{})
 		}
+
+		bn.appendLogPrepare(m, bctx, m.GetFrom())
 
 		wasBelow := uint64(len(bn.prepares[key])) < (2*bn.f + 1)
 		bn.prepares[key][m.GetFrom()] = struct{}{}
@@ -432,6 +499,9 @@ func (bn *BFTNode) Step(ctx context.Context, m *pb.Message) error {
 				bn.commits[key] = make(map[uint64]struct{})
 			}
 			bn.commits[key][bn.selfID] = struct{}{}
+			cBctx := bctx
+			cBctx.Phase = PhaseCommit
+			bn.appendLogCommit(cMsg, cBctx, bn.selfID)
 			bn.broadcast(cMsg)
 
 			if uint64(len(bn.commits[key])) >= (2*bn.f + 1) {
@@ -443,6 +513,8 @@ func (bn *BFTNode) Step(ctx context.Context, m *pb.Message) error {
 		if bn.commits[key] == nil {
 			bn.commits[key] = make(map[uint64]struct{})
 		}
+
+		bn.appendLogCommit(m, bctx, m.GetFrom())
 
 		wasBelow := uint64(len(bn.commits[key])) < (2*bn.f + 1)
 		bn.commits[key][m.GetFrom()] = struct{}{}
@@ -573,24 +645,38 @@ func (bn *BFTNode) onCommitQuorum(key bftSeqKey) [][]byte {
 			data = append(data, ent.Data)
 		}
 	}
+	if key.seq > bn.lastAppliedSeqNum {
+		bn.lastAppliedSeqNum = key.seq
+	}
 	bn.constructCheckpointIfNeeded(key.seq)
 	return data
 }
 
+// stateDigestAt hashes the marshaled pb.Message of each accepted log record through seq.
 func (bn *BFTNode) stateDigestAt(seq uint64) [32]byte {
 	var buf []byte
-	for s := uint64(1); s <= seq; s++ {
-		k := bftSeqKey{view: bn.view, seq: s}
-		if d, ok := bn.pp[k]; ok {
-			buf = append(buf, d[:]...)
+	for i := range bn.messageLog {
+		rec := bn.messageLog[i]
+		if rec.stableProof || rec.phase == PhaseCheckpoint {
+			continue
 		}
+		if rec.logSeq() > seq {
+			continue
+		}
+		if rec.view != bn.view {
+			continue
+		}
+		buf = append(buf, rec.msgBytes...)
 	}
 	return hashData(buf)
 }
 
 func (bn *BFTNode) hasExecutedThrough(seq uint64) bool {
+	if bn.lastAppliedSeqNum < seq {
+		return false
+	}
 	for s := uint64(1); s <= seq; s++ {
-		if _, ok := bn.pp[bftSeqKey{view: bn.view, seq: s}]; !ok {
+		if _, ok := bn.seqNumToLogIndex[bftSeqKey{view: bn.view, seq: s}]; !ok {
 			return false
 		}
 	}
@@ -616,6 +702,121 @@ func (bn *BFTNode) recordCheckpoint(seq uint64, dig [32]byte, replica uint64) {
 		Digest:  dig,
 		Replica: replica,
 	}
+}
+
+func (bn *BFTNode) appendLogPrePrepare(m *pb.Message, bctx BFTContext) {
+	key := bftSeqKey{view: bctx.View, seq: bctx.SeqNum}
+	if _, exists := bn.seqNumToLogIndex[key]; exists {
+		return
+	}
+	idx := uint64(len(bn.messageLog))
+	bn.messageLog = append(bn.messageLog, newLogRecordFromMessage(m, bctx))
+	bn.seqNumToLogIndex[key] = idx
+}
+
+func (bn *BFTNode) appendLogPrepare(m *pb.Message, bctx BFTContext, replica uint64) {
+	key := bftSeqKey{view: bctx.View, seq: bctx.SeqNum}
+	if bn.logPrepareSeen[key] == nil {
+		bn.logPrepareSeen[key] = make(map[uint64]struct{})
+	}
+	if _, seen := bn.logPrepareSeen[key][replica]; seen {
+		return
+	}
+	rec := newLogRecordFromMessage(m, bctx)
+	rec.replica = replica
+	bn.messageLog = append(bn.messageLog, rec)
+	bn.logPrepareSeen[key][replica] = struct{}{}
+}
+
+func (bn *BFTNode) appendLogCommit(m *pb.Message, bctx BFTContext, replica uint64) {
+	key := bftSeqKey{view: bctx.View, seq: bctx.SeqNum}
+	if bn.logCommitSeen[key] == nil {
+		bn.logCommitSeen[key] = make(map[uint64]struct{})
+	}
+	if _, seen := bn.logCommitSeen[key][replica]; seen {
+		return
+	}
+	rec := newLogRecordFromMessage(m, bctx)
+	rec.replica = replica
+	bn.messageLog = append(bn.messageLog, rec)
+	bn.logCommitSeen[key][replica] = struct{}{}
+}
+
+func (bn *BFTNode) appendLogCheckpoint(m *pb.Message, bctx BFTContext) {
+	seq := bctx.CheckpointSeqNum
+	dig := bctx.CheckpointDigest
+	replica := m.GetFrom()
+	if bn.logCheckpointSeen[seq] == nil {
+		bn.logCheckpointSeen[seq] = make(map[[32]byte]map[uint64]struct{})
+	}
+	if bn.logCheckpointSeen[seq][dig] == nil {
+		bn.logCheckpointSeen[seq][dig] = make(map[uint64]struct{})
+	}
+	if _, seen := bn.logCheckpointSeen[seq][dig][replica]; seen {
+		return
+	}
+	bn.messageLog = append(bn.messageLog, newLogRecordFromMessage(m, bctx))
+	bn.logCheckpointSeen[seq][dig][replica] = struct{}{}
+}
+
+func (bn *BFTNode) appendLogStableProof(seq uint64, dig [32]byte, proofs []BFTCheckpointProof) {
+	bn.messageLog = append(bn.messageLog, bftLogRecord{
+		stableProof:    true,
+		view:           bn.view,
+		checkpointSeq:  seq,
+		checkpointDig:  dig,
+		stableProofs:   append([]BFTCheckpointProof(nil), proofs...),
+	})
+}
+
+func (bn *BFTNode) rebuildSeqLogIndex() {
+	bn.seqNumToLogIndex = make(map[bftSeqKey]uint64)
+	for i, rec := range bn.messageLog {
+		if rec.stableProof || rec.phase == PhaseCheckpoint {
+			continue
+		}
+		key := bftSeqKey{view: rec.view, seq: rec.seqNum}
+		if _, exists := bn.seqNumToLogIndex[key]; !exists && rec.phase == PhasePrePrepare {
+			bn.seqNumToLogIndex[key] = uint64(i)
+		}
+	}
+}
+
+func (bn *BFTNode) truncateLogThrough(seq uint64) {
+	kept := make([]bftLogRecord, 0, len(bn.messageLog))
+	for _, rec := range bn.messageLog {
+		if rec.stableProof {
+			continue
+		}
+		if rec.logSeq() > seq {
+			kept = append(kept, rec)
+		}
+	}
+	bn.messageLog = kept
+	bn.rebuildSeqLogIndex()
+
+	for key := range bn.logPrepareSeen {
+		if key.seq <= seq {
+			delete(bn.logPrepareSeen, key)
+		}
+	}
+	for key := range bn.logCommitSeen {
+		if key.seq <= seq {
+			delete(bn.logCommitSeen, key)
+		}
+	}
+	for cpSeq := range bn.logCheckpointSeen {
+		if cpSeq <= seq {
+			delete(bn.logCheckpointSeen, cpSeq)
+		}
+	}
+}
+
+// MessageLogLen returns the number of records in the PBFT message log.
+func (bn *BFTNode) MessageLogLen() int {
+	bn.mu.Lock()
+	defer bn.mu.Unlock()
+	return len(bn.messageLog)
 }
 
 // acceptCheckpoint records a peer checkpoint only if this replica has executed
@@ -653,6 +854,15 @@ func (bn *BFTNode) constructCheckpointIfNeeded(seq uint64) {
 	if err != nil {
 		return
 	}
+	cpBctx := BFTContext{
+		Phase:            PhaseCheckpoint,
+		View:             bn.view,
+		SeqNum:           seq,
+		Digest:           dig,
+		CheckpointSeqNum: seq,
+		CheckpointDigest: dig,
+	}
+	bn.appendLogCheckpoint(cpMsg, cpBctx)
 	bn.broadcast(cpMsg)
 
 	if uint64(len(bn.checkpoints[seq][dig])) >= 2*bn.f+1 {
@@ -686,6 +896,8 @@ func (bn *BFTNode) stabilizeCheckpoint(seq uint64, dig [32]byte) {
 
 	bn.lowW = seq
 	bn.highW = seq + WatermarkWindow
+	bn.truncateLogThrough(seq)
+	bn.appendLogStableProof(seq, dig, proofs)
 	bn.garbageCollect(seq)
 }
 
