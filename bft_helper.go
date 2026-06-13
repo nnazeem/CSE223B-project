@@ -92,6 +92,8 @@ func (bn *BFTNode) installNewView(bctx BFTContext) error {
 		}
 
 		bn.pp[key] = ppCtx.Digest
+		bn.requestTS[key] = ppCtx.RequestTimestamp
+		bn.requestClient[key] = ppCtx.ClientID
 		bn.reqs[key] = proto.Clone(pp).(*pb.Message)
 
 		pMsg, err := bn.ConstructP(ppCtx)

@@ -994,43 +994,88 @@ func (bn *BFTNode) ConstructCheckpoint(seq uint64, digest [32]byte) (*pb.Message
 	}, nil
 }
 
-func (bn *BFTNode) onCommitQuorum(key bftSeqKey) [][]byte {
-	if req := bn.reqs[key]; req != nil {
-		bn.log[key.seq] = req
+func (bn *BFTNode) committedKeyForSeq(seq uint64) (bftSeqKey, bool) {
+	var selected bftSeqKey
+	found := false
+
+	for key, committers := range bn.commits {
+		if key.seq != seq {
+			continue
+		}
+		if uint64(len(committers)) < 2*bn.f+1 {
+			continue
+		}
+		if bn.reqs[key] == nil {
+			continue
+		}
+		if _, ok := bn.pp[key]; !ok {
+			continue
+		}
+		if !found || key.view > selected.view {
+			selected = key
+			found = true
+		}
 	}
 
+	return selected, found
+}
+
+func (bn *BFTNode) removePendingSeq(seq uint64) {
+	newPending := bn.pending[:0]
+	for _, pendingSeq := range bn.pending {
+		if pendingSeq != seq {
+			newPending = append(newPending, pendingSeq)
+		}
+	}
+	bn.pending = newPending
+}
+
+func (bn *BFTNode) refreshPendingTimer() {
+	if len(bn.pending) == 0 {
+		bn.timer.Stop()
+		return
+	}
+	bn.timer.Reset()
+}
+
+func (bn *BFTNode) onCommitQuorum(key bftSeqKey) [][]byte {
 	var data [][]byte
-	if req := bn.reqs[key]; req != nil {
+
+	// A commit certificate only makes a request durable. It must not become
+	// visible in the executed log until every lower sequence number has also
+	// committed. Otherwise a Byzantine primary can make honest replicas expose
+	// log[2] while log[1] is missing, which is an order-safety violation.
+	for {
+		nextSeq := bn.last_replied + 1
+		nextKey, ok := bn.committedKeyForSeq(nextSeq)
+		if !ok {
+			break
+		}
+
+		req := bn.reqs[nextKey]
+		if req == nil {
+			break
+		}
+
+		bn.log[nextSeq] = req
+		bn.last_replied = nextSeq
+
 		for _, ent := range req.GetEntries() {
 			if ent != nil {
 				data = append(data, append([]byte(nil), ent.Data...))
 			}
 		}
-	}
 
-	if bn.last_replied+1 == key.seq {
-		bn.last_replied = key.seq
-		reply, err := bn.ConstructReply(key, []byte("OK"))
+		reply, err := bn.ConstructReply(nextKey, []byte("OK"))
 		if err == nil && reply != nil {
 			bn.bftMsgs = append(bn.bftMsgs, reply)
 		}
 
-		newPending := bn.pending[:0]
-		for _, seq := range bn.pending {
-			if seq != key.seq {
-				newPending = append(newPending, seq)
-			}
-		}
-		bn.pending = newPending
-
-		if len(bn.pending) == 0 {
-			bn.timer.Stop()
-		} else {
-			bn.timer.Reset()
-		}
+		bn.removePendingSeq(nextSeq)
+		bn.constructCheckpointIfNeeded(nextSeq)
 	}
 
-	bn.constructCheckpointIfNeeded(key.seq)
+	bn.refreshPendingTimer()
 	return data
 }
 
