@@ -20,6 +20,8 @@ const (
 	PhaseViewChange
 	PhaseNewView
 	PhaseReply
+	PhaseFetchState
+	PhaseStateResponse
 )
 
 // BFTPreparedProof captures one prepared request proof Pm in a view-change.
